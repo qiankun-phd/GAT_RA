@@ -1,0 +1,7 @@
+model_checkpoint_path: "/home/qiankun/GAT_RA/model/PPO_no_meta_AC_100_6_1000_2.5e-06_0.3_indoor_/agent_5"
+all_model_checkpoint_paths: "/home/qiankun/GAT_RA/model/PPO_no_meta_AC_100_6_1000_2.5e-06_0.3_indoor_/agent_0"
+all_model_checkpoint_paths: "/home/qiankun/GAT_RA/model/PPO_no_meta_AC_100_6_1000_2.5e-06_0.3_indoor_/agent_1"
+all_model_checkpoint_paths: "/home/qiankun/GAT_RA/model/PPO_no_meta_AC_100_6_1000_2.5e-06_0.3_indoor_/agent_2"
+all_model_checkpoint_paths: "/home/qiankun/GAT_RA/model/PPO_no_meta_AC_100_6_1000_2.5e-06_0.3_indoor_/agent_3"
+all_model_checkpoint_paths: "/home/qiankun/GAT_RA/model/PPO_no_meta_AC_100_6_1000_2.5e-06_0.3_indoor_/agent_4"
+all_model_checkpoint_paths: "/home/qiankun/GAT_RA/model/PPO_no_meta_AC_100_6_1000_2.5e-06_0.3_indoor_/agent_5"

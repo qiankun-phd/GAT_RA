@@ -1,0 +1,671 @@
+import random
+import concurrent.futures
+import numpy as np
+# import gym
+import os
+from PPO_brain_AC import PPO
+import matplotlib.pyplot as plt
+import Environment_marl_indoor
+# Optional imports for other environments (comment out if not available)
+# import Environment_marl_urban_micro
+# import Environment_marl_urban_macro
+# import Environment_marl_rural_macro
+
+from arguments import get_args
+args = get_args()
+import random
+from tensorflow.compat.v1 import set_random_seed
+import tensorflow.compat.v1 as tf
+from datetime import datetime
+
+os.environ['PYTHONHASHSEED'] = str(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+set_random_seed(args.set_random_seed)
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices'
+# env = gym.make('Pendulum-v1')
+# env = env.unwrapped
+meta_episode = args.meta_episode
+target_average_step = args.target_average_step
+
+
+IS_PPO = args.IS_PPO
+IS_meta = args.Do_meta
+IS_FL = args.Do_FL
+n_veh = args.n_veh
+n_RB = args.n_RB
+
+# Get SE/EE weighting parameters from config
+optimization_target = args.optimization_target if hasattr(args, 'optimization_target') else 'SE_EE'
+beta = args.beta if hasattr(args, 'beta') else 0.5
+circuit_power = args.circuit_power if hasattr(args, 'circuit_power') else 0.06
+
+# Get semantic communication parameters
+semantic_A_max = args.semantic_A_max if hasattr(args, 'semantic_A_max') else 1.0
+semantic_beta = args.semantic_beta if hasattr(args, 'semantic_beta') else 2.0
+collision_penalty = args.collision_penalty if hasattr(args, 'collision_penalty') else -0.5
+low_accuracy_penalty = args.low_accuracy_penalty if hasattr(args, 'low_accuracy_penalty') else -0.3
+accuracy_threshold = args.accuracy_threshold if hasattr(args, 'accuracy_threshold') else 0.5
+
+env_indoor = Environment_marl_indoor.Environ(
+    n_veh, n_RB, 
+    beta=beta, 
+    circuit_power=circuit_power, 
+    optimization_target=optimization_target,
+    semantic_A_max=semantic_A_max,
+    semantic_beta=semantic_beta
+)
+# env_cannon = Environment_marl_urban_micro.Environ(n_veh, n_RB, beta=beta, circuit_power=circuit_power, optimization_target=optimization_target)
+# env_urban = Environment_marl_urban_macro.Environ(n_veh, n_RB, beta=beta, circuit_power=circuit_power, optimization_target=optimization_target)
+# env_rural = Environment_marl_rural_macro.Environ(n_veh, n_RB, beta=beta, circuit_power=circuit_power, optimization_target=optimization_target)
+
+env_choice = args.env_choice if hasattr(args, 'env_choice') else 0
+if env_choice == 0:
+    env = env_indoor
+    env_label = "indoor"
+else:
+    # For now, only indoor environment is available
+    # Other environments can be added later
+    print(f"Warning: env_choice={env_choice} not available, using indoor environment")
+    env = env_indoor
+    env_label = "indoor"
+env.new_random_game()
+
+GAMMA = args.gamma
+BATCH_SIZE = args.meta_batch_size
+i_episode = 0
+n_episode = args.n_episode
+ACTOR_NUM = 1
+T_TIMESTEPS = int(env.time_slow / (env.time_fast))
+current_fed_times = 0
+
+
+def get_state(env, idx=(0, 0), n_veh = 0, ind_episode=0.):
+    """ Get state from the environment (backward compatibility for MLP) """
+    cellular_fast = (env.cellular_channels_with_fastfading[idx[0], :] - env.cellular_channels_abs[idx[0]] + 10) / 35
+    cellular_abs = (env.cellular_channels_abs[idx[0]] - 80) / 60.0
+    success = env.success[idx[0]]
+    channel_choice = env.channel_choice / n_veh
+    vehicle_vector = np.zeros(n_RB)
+    for i in range (n_veh):
+        vehicle_vector[i] = 1 / n_veh
+    return np.concatenate((np.reshape(cellular_fast, -1), np.reshape(cellular_abs, -1), np.reshape(channel_choice, -1), vehicle_vector,
+                           np.asarray([success, ind_episode / (n_episode)])))
+
+def get_graph_data(env, n_veh, ind_episode=0.):
+    """
+    Get graph-structured data from environment for GAT network
+    Returns:
+        node_features: [n_veh, node_feature_dim] node features for all UAVs
+        adj_matrix: [n_veh, n_veh] adjacency matrix
+    """
+    n_RB = env.n_RB
+    node_features = []
+    
+    for i in range(n_veh):
+        # Node features for each UAV
+        # 1. CSI features (fast fading and slow fading)
+        cellular_fast = (env.cellular_channels_with_fastfading[i, :] - env.cellular_channels_abs[i] + 10) / 35
+        cellular_abs = (env.cellular_channels_abs[i] - 80) / 60.0
+        
+        # 2. Position (3D coordinates)
+        uav_pos = env.vehicles[i].position
+        # Normalize position to [0, 1]
+        pos_normalized = [
+            uav_pos[0] / env.width,
+            uav_pos[1] / env.height,
+            (uav_pos[2] - env.height_min) / (env.height_max - env.height_min)
+        ]
+        
+        # 3. Other state information
+        success = env.success[i]
+        episode_progress = ind_episode / n_episode
+        
+        # 4. Channel choice (normalized)
+        channel_choice = env.channel_choice / n_veh if n_veh > 0 else np.zeros(n_RB)
+        
+        # Concatenate all features
+        node_feat = np.concatenate([
+            np.reshape(cellular_fast, -1),      # [n_RB]
+            np.reshape(cellular_abs, -1),       # [n_RB]
+            pos_normalized,                     # [3]
+            [success, episode_progress],         # [2]
+            np.reshape(channel_choice, -1)      # [n_RB]
+        ])
+        node_features.append(node_feat)
+    
+    node_features = np.array(node_features)  # [n_veh, node_feature_dim]
+    
+    # Get adjacency matrix from environment
+    adj_matrix = env.get_adjacency_matrix()  # [n_veh, n_veh]
+    
+    return node_features, adj_matrix
+
+def batch_graphs(node_features_list, adj_matrices_list):
+    """
+    Batch multiple graphs into block diagonal format for TensorFlow GAT
+    Args:
+        node_features_list: list of [n_i, F] node feature matrices
+        adj_matrices_list: list of [n_i, n_i] adjacency matrices
+    Returns:
+        batched_node_features: [sum(n_i), F] concatenated node features
+        batched_adj_matrix: [sum(n_i), sum(n_i)] block diagonal adjacency matrix
+        graph_sizes: list of graph sizes for unbatching
+    """
+    if len(node_features_list) == 0:
+        return None, None, []
+    
+    # Concatenate node features
+    batched_node_features = np.concatenate(node_features_list, axis=0)
+    
+    # Create block diagonal adjacency matrix
+    total_nodes = sum(nf.shape[0] for nf in node_features_list)
+    batched_adj_matrix = np.zeros((total_nodes, total_nodes), dtype=np.float32)
+    
+    graph_sizes = []
+    node_offset = 0
+    
+    for i, (nf, adj) in enumerate(zip(node_features_list, adj_matrices_list)):
+        n_nodes = nf.shape[0]
+        graph_sizes.append(n_nodes)
+        
+        # Place adjacency matrix in block diagonal position
+        batched_adj_matrix[node_offset:node_offset+n_nodes, 
+                          node_offset:node_offset+n_nodes] = adj
+        
+        node_offset += n_nodes
+    
+    return batched_node_features, batched_adj_matrix, graph_sizes
+
+def unbatch_graph_features(batched_features, graph_sizes):
+    """
+    Unbatch graph features back to individual graphs
+    Args:
+        batched_features: [sum(n_i), F] batched features
+        graph_sizes: list of graph sizes
+    Returns:
+        list of [n_i, F] feature matrices
+    """
+    features_list = []
+    offset = 0
+    for size in graph_sizes:
+        features_list.append(batched_features[offset:offset+size])
+        offset += size
+    return features_list
+
+def save_models(sess, model_path, saver):
+    """ Save models to the current directory with the name filename """
+
+    current_dir = os.path.dirname(os.path.realpath(__file__))
+    model_path = os.path.join(current_dir, "model/" + model_path)
+    if not os.path.exists(os.path.dirname(model_path)):
+        os.makedirs(os.path.dirname(model_path))
+    saver.save(sess, model_path, write_meta_graph=False)
+
+# Check if using GAT (default: True for new implementation)
+use_gat = getattr(args, 'use_gat', True)
+
+if use_gat:
+    # GAT mode: use graph-structured input
+    # Get node feature dimension from a sample graph
+    sample_node_features, _ = get_graph_data(env, n_veh, i_episode)
+    node_feature_dim = sample_node_features.shape[1]
+    state_dim = node_feature_dim  # Keep for backward compatibility
+    print(f"GAT mode: node_feature_dim={node_feature_dim}")
+else:
+    # MLP mode: use flat state vector
+    state_dim = len(get_state(env=env))
+    node_feature_dim = None
+    print(f"MLP mode: state_dim={state_dim}")
+
+action_dim = 3  # RB_choice + power + compression_ratio (updated for semantic communication)
+action_bound = []
+action_bound.append(n_RB)
+action_bound.append(args.RB_action_bound)
+action_bound.append(1.0)  # Compression ratio bound [0, 1]
+
+ppoes = []
+ppoes = PPO(state_dim, action_bound, args.weight_for_L_vf, args.weight_for_entropy, args.epsilon, 
+            args.lr_main, args.lr_meta_a, args.minibatch_steps, n_veh, n_RB, IS_meta, meta_episode,
+            use_gat=use_gat, num_gat_heads=getattr(args, 'num_gat_heads', 4), 
+            node_feature_dim=node_feature_dim)
+
+
+executor = concurrent.futures.ThreadPoolExecutor(ACTOR_NUM)
+
+
+def simulate():
+    env.renew_positions()  # update vehicle position
+    env.renew_neighbor()  # update neighbor relationships for graph
+    env.renew_BS_channel()  # update channel slow fading
+    env.renew_BS_channels_fastfading()  # update channel fast fading
+    r_sum = 0
+    trans_all_user = []
+    success_alls = []
+    
+    # Graph-structured data storage
+    node_features_list = []
+    adj_matrices_list = []
+    action_alls = []
+    v_pred_alls = []
+    rewards = []
+    
+    # Track semantic EE for each agent (for weighted averaging)
+    semantic_EE_per_agent = np.zeros(n_veh)  # Accumulate semantic EE for each agent
+    semantic_EE_count = np.zeros(n_veh)  # Count of valid semantic EE samples
+    
+    # Simplified: no need to track separate reward components
+
+    for step in range(T_TIMESTEPS):
+        env.renew_BS_channels_fastfading()
+        env.renew_neighbor()  # Update graph topology
+        
+        # Get graph data for current step
+        node_features, adj_matrix = get_graph_data(env, n_veh, i_episode)
+        node_features_list.append(node_features)
+        adj_matrices_list.append(adj_matrix)
+        
+        action_all = []
+        v_pred_all = []
+        reward_all = []
+        action_all_training = np.zeros([n_veh, 3], dtype='float32')  # Updated to 3D: RB, Power, Compression
+
+        # Select actions using graph data
+        # In GAT mode, all agents share the same graph, but each agent gets its own action
+        if ppoes.use_gat:
+            # GAT mode: use graph data for all agents
+            # All agents use the same graph, but each agent (node) gets its own action
+            # Get actions for all agents at once (GAT outputs [n_veh, action_dim])
+            for i in range(n_veh):
+                action = ppoes.choose_action(s=None, sess=ppoes.sesses[i], 
+                                            node_features=node_features, 
+                                            adj_matrix=adj_matrix,
+                                            agent_idx=i)  # Pass agent index to select correct node's action
+                v_pred = ppoes.get_v(s=None, sess=ppoes.sesses[i],
+                                   node_features=node_features,
+                                   adj_matrix=adj_matrix,
+                                   agent_idx=i)  # Pass agent index
+                action_all.append(action)
+                v_pred_all.append(v_pred)
+        else:
+            # MLP mode: use flat state (backward compatibility)
+            for i in range(n_veh):
+                state = get_state(env, [i, 0], n_veh, i_episode)
+                action = ppoes.choose_action(state, ppoes.sesses[i])
+                v_pred = ppoes.get_v(state, ppoes.sesses[i])
+                action_all.append(action)
+                v_pred_all.append(v_pred)
+        
+        # Process actions: [RB_index, power, compression_ratio]
+        for i in range(n_veh):
+            action = action_all[i]
+            amp = env.cellular_power_dB_List[0] / (2 * action_bound[1])  # Power bound
+            power_action = (action[1] + action_bound[1]) * amp
+            action_all_training[i, 0] = int(action[0])  # RB index
+            action_all_training[i, 1] = power_action  # Power (dB)
+            action_all_training[i, 2] = np.clip(action[2], 0.0, 1.0)  # Compression ratio
+        
+        # Execute actions and get reward (simplified)
+        action_temp = action_all_training.copy()
+        train_reward = env.act_for_training(action_temp, IS_PPO)
+        
+        # Get semantic EE for each agent (for weighted averaging)
+        # Compute performance to get semantic EE
+        results = env.Compute_Performance_Reward_Train(action_temp, IS_PPO=True)
+        if len(results) >= 6:
+            _, _, _, _, semantic_accuracy, semantic_EE_penalized, _ = results
+            # Accumulate semantic EE for each agent
+            for i in range(n_veh):
+                if semantic_EE_penalized[i] > -10.0:  # Filter out extremely negative values
+                    semantic_EE_per_agent[i] += semantic_EE_penalized[i]
+                    semantic_EE_count[i] += 1
+        
+        for i in range(n_veh):
+            reward_all.append(train_reward)
+        
+        success_all = env.success
+        r_sum += train_reward
+
+        action_alls.append(np.array(action_all))
+        v_pred_alls.append(np.array(v_pred_all))
+        rewards.append(np.array(reward_all))
+        success_alls.append(success_all)
+
+    # Process collected data
+    # Convert lists to arrays
+    action_alls = np.array(action_alls)  # [T_TIMESTEPS, n_veh, action_dim]
+    v_pred_alls = np.array(v_pred_alls)  # [T_TIMESTEPS, n_veh]
+    rewards = np.array(rewards)  # [T_TIMESTEPS, n_veh]
+    success_alls = np.array(success_alls)  # [T_TIMESTEPS, n_veh]
+    
+    # Normalize rewards
+    rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    
+    # Compute next state values
+    v_preds_next = np.zeros_like(v_pred_alls)
+    v_preds_next[:-1] = v_pred_alls[1:]
+    v_preds_next[-1] = np.zeros(n_veh)  # Terminal state
+    
+    # Compute GAEs
+    gaes = ppoes.get_gaes(rewards=rewards.flatten(), 
+                         v_preds=v_pred_alls.flatten(), 
+                         v_preds_next=v_preds_next.flatten())
+    gaes = np.array(gaes).astype(dtype=np.float32)
+    gaes = gaes.reshape([T_TIMESTEPS, n_veh])
+    gaes = (gaes - gaes.mean()) / (gaes.std() + 1e-8)
+
+    # Calculate average semantic EE for each agent
+    avg_semantic_EE = np.zeros(n_veh)
+    for i in range(n_veh):
+        if semantic_EE_count[i] > 0:
+            avg_semantic_EE[i] = semantic_EE_per_agent[i] / semantic_EE_count[i]
+        else:
+            avg_semantic_EE[i] = 0.0  # Default to 0 if no valid samples
+    
+    # Prepare graph data for training
+    if ppoes.use_gat:
+        # Store graph data
+        trans_all_user = [node_features_list, adj_matrices_list, action_alls, gaes, rewards, v_preds_next]
+    else:
+        # MLP mode: convert to flat states (backward compatibility)
+        state_alls = []
+        for step in range(T_TIMESTEPS):
+            state_step = []
+            for i in range(n_veh):
+                state = get_state(env, [i, 0], n_veh, i_episode)
+                state_step.append(state)
+            state_alls.append(state_step)
+        state_alls = np.array(state_alls)  # [T_TIMESTEPS, n_veh, state_dim]
+        trans_all_user = [state_alls, action_alls, gaes, rewards, v_preds_next]
+
+    return r_sum / T_TIMESTEPS, trans_all_user, success_alls.sum(axis = 0) / T_TIMESTEPS, avg_semantic_EE
+
+record_reward = []
+loss_episode = []
+
+# 初始化TensorBoard
+# 构建日志目录名称：网络类型_优化目标_算法_训练模式_[参数]
+# 优化目标：Semantic_EE (语义能量效率)
+opt_target_str = "Semantic_EE"  # 语义通信使用语义EE作为优化目标
+
+# 网络类型：GAT 或 MLP
+if ppoes.use_gat:
+    network_type = "GAT"
+    network_params = f"heads{ppoes.num_gat_heads}"
+else:
+    network_type = "MLP"
+    network_params = ""
+
+# 算法：MAPPO
+algorithm_str = "MAPPO"
+
+# 训练模式：FRL, MFRL, MRL, 或空
+if IS_FL and IS_meta:
+    training_mode = "MFRL"  # Meta Federated Learning
+elif IS_FL:
+    training_mode = "FRL"   # Federated Learning
+elif IS_meta:
+    training_mode = "MRL"   # Meta Reinforcement Learning
+else:
+    training_mode = "RL"    # 标准强化学习
+
+# 语义通信参数
+semantic_params = f"A{args.semantic_A_max}_beta{args.semantic_beta}"
+
+# 组合日志名称
+log_name_parts = [network_type]
+if network_params:
+    log_name_parts.append(network_params)
+log_name_parts.extend([opt_target_str, algorithm_str, training_mode])
+log_name_parts.append(semantic_params)
+
+# 添加环境参数
+log_name_parts.append(f"UAV{n_veh}_RB{n_RB}")
+
+log_name = "_".join(log_name_parts)
+
+log_dir = f'./logs/tensorboard/{log_name}'
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+writer = tf.summary.FileWriter(log_dir)
+print(f"TensorBoard日志目录: {log_dir}")
+print(f"启动TensorBoard: tensorboard --logdir=./logs/tensorboard --port=6008")
+
+for episode_idx in range(n_episode):
+    i_episode = i_episode + 1
+    futures = [executor.submit(simulate) for _ in range(ACTOR_NUM)]
+    concurrent.futures.wait(futures)
+    r_avgs = []
+    success_rates = []
+    semantic_EE_avgs = []  # Store semantic EE for each simulation
+    for f in futures:
+        r_avg, trans_all_user, success_rate, avg_semantic_EE = f.result()
+        r_avgs.append(r_avg)
+        semantic_EE_avgs.append(avg_semantic_EE)
+    record_reward.append(sum(r_avgs))
+    
+    # Calculate average semantic EE across all simulations for each agent
+    if len(semantic_EE_avgs) > 0:
+        avg_semantic_EE_all = np.mean(semantic_EE_avgs, axis=0)  # [n_veh]
+    else:
+        avg_semantic_EE_all = np.zeros(n_veh)
+
+    
+    loss_batch = []
+    
+    if ppoes.use_gat:
+        # GAT mode: handle graph-structured data
+        node_features_list, adj_matrices_list, action_alls, gaes, rewards, v_preds_next = trans_all_user
+        
+        # Sample indices
+        n_samples = len(node_features_list)
+        sample_size = min(BATCH_SIZE, n_samples)
+        sample_indices = np.random.randint(low=0, high=n_samples, size=sample_size)
+        
+        # Sample graph data
+        sampled_node_features = [node_features_list[i] for i in sample_indices]
+        sampled_adj_matrices = [adj_matrices_list[i] for i in sample_indices]
+        sampled_actions = action_alls[sample_indices]  # [batch, n_veh, action_dim]
+        sampled_gaes = gaes[sample_indices]  # [batch, n_veh]
+        sampled_rewards = rewards[sample_indices]  # [batch, n_veh]
+        sampled_v_preds_next = v_preds_next[sample_indices]  # [batch, n_veh]
+        
+        # For GAT training, we process each agent separately
+        # Each agent uses the same graph but has different actions
+        loss_all = []
+        policy_losses = []
+        vf_losses = []
+        entropies = []
+        
+        # Collect diagnostics across all agents
+        all_actor_losses = []
+        all_critic_losses = []
+        all_total_losses = []
+        all_entropies = []
+        all_gradient_norms = []
+        all_rho_means = []
+        all_rho_stds = []
+        
+        # Optimized: Batch all graphs together for each agent
+        # Stack all node features and adj matrices: [batch_size, n_veh, node_feature_dim]
+        batched_node_features = np.stack(sampled_node_features, axis=0)  # [batch, n_veh, node_feature_dim]
+        batched_adj_matrices = np.stack(sampled_adj_matrices, axis=0)  # [batch, n_veh, n_veh]
+        
+        for agent_idx in range(n_veh):
+            # Extract data for this agent across all sampled timesteps
+            agent_actions = sampled_actions[:, agent_idx, :]  # [batch, action_dim]
+            agent_gaes = sampled_gaes[:, agent_idx]  # [batch]
+            agent_rewards = sampled_rewards[:, agent_idx]  # [batch]
+            agent_v_preds_next = sampled_v_preds_next[:, agent_idx]  # [batch]
+            
+            # Batch training: train on all timesteps at once
+            # This is much faster than training each timestep separately
+            loss = ppoes.train(s=None, a=agent_actions, gae=agent_gaes, 
+                             reward=agent_rewards, v_pred_next=agent_v_preds_next,
+                             sess=ppoes.sesses[agent_idx],
+                             node_features=batched_node_features,
+                             adj_matrix=batched_adj_matrices)
+            
+            # Extract detailed diagnostics
+            # loss format: ([detailed_loss], entropy_value)
+            # detailed_loss: [L_clip_power, L_clip_RB, L_clip_rho, L_vf, S, actor_loss, critic_loss, total_loss, entropy_value, gradient_norm, rho_mean, rho_std]
+            if len(loss[0]) >= 1 and isinstance(loss[0][0], (list, np.ndarray)) and len(loss[0][0]) >= 12:
+                detailed_loss = loss[0][0]
+                actor_loss = detailed_loss[5]
+                critic_loss = detailed_loss[6]
+                total_loss = detailed_loss[7]
+                entropy_val = detailed_loss[8]
+                grad_norm = detailed_loss[9]
+                rho_mean = detailed_loss[10]
+                rho_std = detailed_loss[11]
+                
+                all_actor_losses.append(actor_loss)
+                all_critic_losses.append(critic_loss)
+                all_total_losses.append(total_loss)
+                all_entropies.append(entropy_val)
+                all_gradient_norms.append(grad_norm)
+                all_rho_means.append(rho_mean)
+                all_rho_stds.append(rho_std)
+                
+                policy_losses.append(detailed_loss[0] + detailed_loss[1] + detailed_loss[2])  # L_clip_power + L_clip_RB + L_clip_rho
+                vf_losses.append(detailed_loss[3])  # L_vf
+            elif len(loss[0]) >= 5:
+                # Backward compatibility with old format
+                policy_losses.append(loss[0][0] + loss[0][1] + loss[0][2])  # L_clip_power + L_clip_RB + L_clip_rho
+                vf_losses.append(loss[0][3])  # L_vf
+                entropies.append(loss[0][4])  # S
+            loss_all.append(loss[1])
+        
+    else:
+        # MLP mode: backward compatibility
+        state_alls, action_alls, gaes, rewards, v_preds_next = trans_all_user
+        sample_indices = np.random.randint(low=0, high=state_alls.shape[0], size=BATCH_SIZE)
+        sampled_inp = [np.take(a=a, indices=sample_indices, axis=0) for a in trans_all_user]
+        
+        loss_all = []
+        policy_losses = []
+        vf_losses = []
+        entropies = []
+        
+        for agent_idx in range(n_veh):
+            s = sampled_inp[0][:, agent_idx, :]
+            a = sampled_inp[1][:, agent_idx, :]
+            gae = sampled_inp[2][:, agent_idx]
+            reward = sampled_inp[3][:, agent_idx]
+            v_pred_next = sampled_inp[4][:, agent_idx]
+            
+            loss = ppoes.train(s, a, gae, reward, v_pred_next, ppoes.sesses[agent_idx])
+            if len(loss[0]) >= 4:
+                policy_losses.append(loss[0][0] + loss[0][1])  # L_clip + L_RB
+                vf_losses.append(loss[0][2])  # L_vf
+                entropies.append(loss[0][3])  # S
+            loss_all.append(loss[1])
+    
+    loss_batch.append(sum(loss_all))
+    loss_episode.append(sum(loss_batch)/BATCH_SIZE)
+    print('Episode:', episode_idx, 'Sum Reward', r_avg, 'Success Rate', success_rate, 'Loss_episode: ', loss_episode[-1])
+    
+    # 记录到TensorBoard
+    summary = tf.Summary()
+    
+    summary.value.add(tag='Train/reward', simple_value=float(r_avg)*6)
+    summary.value.add(tag='Train/Loss_episode', simple_value=float(loss_episode[-1]))
+    
+    # Detailed Loss Components
+    if len(all_actor_losses) > 0:
+        summary.value.add(tag='Loss/Actor_Loss', simple_value=float(np.mean(all_actor_losses)))
+        summary.value.add(tag='Loss/Critic_Loss', simple_value=float(np.mean(all_critic_losses)))
+        summary.value.add(tag='Loss/Total_PPO_Loss', simple_value=float(np.mean(all_total_losses)))
+    
+    if len(policy_losses) > 0:
+        # policy_losses contains sum of L_clip_power + L_clip_RB + L_clip_rho
+        # We can't separate them from policy_losses, but we log the total
+        summary.value.add(tag='Loss/Policy_Loss_Total', simple_value=float(np.mean(policy_losses)))
+    
+    if len(vf_losses) > 0:
+        summary.value.add(tag='Loss/Value_Function_Loss', simple_value=float(np.mean(vf_losses)))
+    
+    # Policy Entropy
+    if len(all_entropies) > 0:
+        summary.value.add(tag='Policy/Entropy', simple_value=float(np.mean(all_entropies)))
+        summary.value.add(tag='Policy/Entropy_std', simple_value=float(np.std(all_entropies)))
+    elif len(entropies) > 0:
+        summary.value.add(tag='Policy/Entropy', simple_value=float(np.mean(entropies)))
+    
+    # Gradient Norm
+    if len(all_gradient_norms) > 0:
+        summary.value.add(tag='Training/Gradient_Norm', simple_value=float(np.mean(all_gradient_norms)))
+        summary.value.add(tag='Training/Gradient_Norm_max', simple_value=float(np.max(all_gradient_norms)))
+    
+    # Simplified: no separate reward components to log
+    
+    # Action Distribution (Rho)
+    if len(all_rho_means) > 0:
+        summary.value.add(tag='Action/Rho_Mean', simple_value=float(np.mean(all_rho_means)))
+        summary.value.add(tag='Action/Rho_Std', simple_value=float(np.mean(all_rho_stds)))
+        summary.value.add(tag='Action/Rho_Mean_std', simple_value=float(np.std(all_rho_means)))
+    
+    # Success Rate
+    if isinstance(success_rate, np.ndarray):
+        summary.value.add(tag='Metrics/success_rate_mean', simple_value=float(np.mean(success_rate)))
+        for idx, rate in enumerate(success_rate):
+            summary.value.add(tag=f'Metrics/success_rate_ue_{idx}', simple_value=float(rate))
+    else:
+        summary.value.add(tag='Metrics/success_rate', simple_value=float(success_rate))
+    
+    # Semantic EE metrics
+    try:
+        if 'avg_semantic_EE_all' in locals() and len(avg_semantic_EE_all) > 0:
+            if isinstance(avg_semantic_EE_all, np.ndarray):
+                semantic_EE_mean = float(np.mean(avg_semantic_EE_all))
+                semantic_EE_max = float(np.max(avg_semantic_EE_all))
+                semantic_EE_min = float(np.min(avg_semantic_EE_all))
+                summary.value.add(tag='Semantic/semantic_EE_mean', simple_value=semantic_EE_mean)
+                summary.value.add(tag='Semantic/semantic_EE_max', simple_value=semantic_EE_max)
+                summary.value.add(tag='Semantic/semantic_EE_min', simple_value=semantic_EE_min)
+                for idx, ee in enumerate(avg_semantic_EE_all):
+                    summary.value.add(tag=f'Semantic/semantic_EE_ue_{idx}', simple_value=float(ee))
+    except Exception as e:
+        # Skip semantic EE metrics if there's an error
+        pass
+    
+    # 使用 i_episode 作为 x 轴（从1开始，更符合"第几个episode"的概念）
+    # 或者使用 episode_idx（从0开始）
+    writer.add_summary(summary, i_episode)  # x轴显示为 episode 编号
+    writer.flush()
+
+    if i_episode == int(n_episode / 2):
+        label_early = '%d_' % target_average_step + '%d_' % n_veh + '%d_' % i_episode + '%s_' %args.lr_main + '%s_' %args.sigma_add + '%s_' %env_label
+        if IS_meta:
+            np.savetxt('./Train_data/Reward_AC_'+'%d_' %meta_episode+ label_early, record_reward)
+            np.savetxt('./Train_data/loss_AC_'+'%d_' %meta_episode+ label_early, loss_episode)
+            ppoes.save_models('PPO_AC_' +'%d_' %meta_episode+ label_early)
+        else:
+            np.savetxt('./Train_data/Reward_no_meta_AC_' + label_early, record_reward)
+            np.savetxt('./Train_data/loss_no_meta_AC_' + label_early, loss_episode)
+            ppoes.save_models('PPO_no_meta_AC_' + label_early)
+
+    # 联邦学习：模型平均（仅在开启FL开关时执行）
+    if IS_FL and i_episode % target_average_step == target_average_step - 1 and i_episode < 0.9 * n_episode:
+        print('Model averaged ' + '%d' % current_fed_times)
+        print(f'Semantic EE per agent: {avg_semantic_EE_all}')
+        current_fed_times = current_fed_times + 1
+        # Use uniform averaging (equal weights for all agents)
+        ppoes.averaging_model(success_rate, semantic_EE_weights=None)
+
+label_base = '%d_' %target_average_step+ '%d_' %n_veh + '%d_' %n_episode + '%s_' %args.lr_main + '%s_' %args.sigma_add + '%s_' %env_label
+if IS_meta:
+    np.savetxt('./Train_data/Reward_AC_'+'%d_' %meta_episode+ label_base, record_reward)
+    np.savetxt('./Train_data/loss_AC_'+'%d_' %meta_episode+ label_base, loss_episode)
+    ppoes.save_models('PPO_AC_' +'%d_' %meta_episode+ label_base)
+else:
+    np.savetxt('./Train_data/Reward_no_meta_AC_'+ label_base, record_reward)
+    np.savetxt('./Train_data/loss_no_meta_AC_'+ label_base, loss_episode)
+    ppoes.save_models('PPO_no_meta_AC_' + label_base)
+
+# 关闭TensorBoard writer
+writer.close()
+print(f"\n训练完成！TensorBoard日志已保存到: {log_dir}")
+print(f"查看TensorBoard: tensorboard --logdir=./logs/tensorboard --port=6008")
