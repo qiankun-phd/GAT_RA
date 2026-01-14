@@ -191,15 +191,16 @@ Vehicle = UAV
 class Environ:
     def __init__(self, n_veh, n_RB, beta=0.5, circuit_power=0.06, optimization_target='SE_EE',
                  area_size=25.0, height_min=1.5, height_max=1.5, comm_range=500.0,
-                 semantic_A_max=1.0, semantic_beta=2.0):
+                 semantic_A_max=1.0, semantic_beta=2.0,
+                 semantic_A1=1.0, semantic_A2=0.2, semantic_C1=5.0, semantic_C2=2.0):
         """
         Initialize environment for UAV network
         Args:
             n_veh: number of UAVs
             n_RB: number of resource blocks
-            beta: Weight for SE in reward calculation when optimization_target='SE_EE' (0.0-1.0), EE weight = 1 - beta (default: 0.5)
+            beta: (Deprecated, not used) Kept for backward compatibility
             circuit_power: Circuit power in linear scale for EE calculation (default: 0.06)
-            optimization_target: Optimization target - 'SE', 'EE', or 'SE_EE' (default: 'SE_EE')
+            optimization_target: Fixed to 'SEE' (only optimize Semantic-EE)
             area_size: Size of the area in meters (default: 25m x 25m to match original environment)
             height_min: Minimum UAV height in meters (default: 50m)
             height_max: Maximum UAV height in meters (default: 200m)
@@ -247,16 +248,24 @@ class Environ:
         self.BW = [0.18, 0.18, 0.36, 0.36, 0.36, 0.72, 0.72, 0.72, 1.44, 1.44] # MHz
         self.channel_choice = np.zeros([self.n_RB])
         self.success = np.zeros([self.n_Veh])
+        self.similarity_success = np.zeros([self.n_Veh])  # Track similarity threshold achievement
         self.sig2 = [i * 1e6 * 10 ** (self.sig2_dB / 10) for i in self.BW]
         
-        # Reward weighting parameters for SE and EE (configurable)
-        self.optimization_target = optimization_target  # 'SE', 'EE', or 'SE_EE'
-        self.beta = beta  # Weight for SE (0.0 to 1.0), EE weight = 1 - beta (only used when optimization_target='SE_EE')
+        # Optimization target: only Semantic-EE (SEE)
+        self.optimization_target = 'SEE'  # Fixed to SEE (only optimize Semantic-EE)
+        self.beta = beta  # Deprecated, kept for backward compatibility (not used in reward calculation)
         self.circuit_power = circuit_power  # Circuit power in linear scale
 
         # Semantic Communication parameters
-        self.semantic_A_max = semantic_A_max  # Maximum semantic accuracy (mAP)
+        self.semantic_A_max = semantic_A_max  # Maximum semantic accuracy (mAP) - deprecated, use A1 instead
         self.semantic_beta = semantic_beta  # Compression ratio sensitivity parameter
+        
+        # Sigmoid model parameters for semantic accuracy
+        # Formula: epsilon(gamma) = (A1 - A2) / (1 + exp(-(C1*gamma + C2))) + A2
+        self.semantic_A1 = semantic_A1  # Upper bound of accuracy (typically ≈ 1.0)
+        self.semantic_A2 = semantic_A2  # Lower bound of accuracy (typically 0.0-0.2)
+        self.semantic_C1 = semantic_C1  # Slope parameter (controls sensitivity to SINR)
+        self.semantic_C2 = semantic_C2  # Offset parameter (controls curve center)
 
     def add_new_vehicles(self, start_position, start_velocity=None):
         """
@@ -423,7 +432,8 @@ class Environ:
             actions_all: Optional, action array [n_veh, 2 or 3]
             IS_PPO: bool or int, whether using PPO/DDPG format
         Returns:
-            (cellular_Rate, cellular_SINR, SE, EE, semantic_accuracy, semantic_EE, collisions)
+            (cellular_Rate, cellular_SINR, SE, EE, semantic_accuracy, semantic_EE, collisions,
+             semantic_Rate, semantic_SE)
         """
         # 如果没有提供actions，则使用默认的第一个RB和默认压缩比
         if actions_all is None:
@@ -465,13 +475,31 @@ class Environ:
         # Calculate semantic accuracy (will be low due to low SINR)
         semantic_accuracy = np.zeros(self.n_Veh)
         semantic_EE = np.zeros(self.n_Veh)
+        semantic_Rate = np.zeros(self.n_Veh)  # Semantic Rate R^s
+        semantic_SE = np.zeros(self.n_Veh)    # Semantic Spectral Efficiency
         transmission_power_linear = 10 ** (transmit_power / 10)
 
         for i in range(len(self.vehicles)):
             semantic_accuracy[i] = self.compute_semantic_accuracy(rho[i], cellular_SINR[i])
+            
+            # Semantic Rate: S = W * (I/K) * L * epsilon(K,gamma)
+            # where I/K is semantic information density, modeled as I/K = rho
+            # L is a scaling factor (could be 1.0 or related to compression)
+            # For simplicity, we use: S = W * rho * epsilon(gamma)
+            l = actions[i]
+            W = self.BW[l]
+            LK = rho[i]  # I/K = rho (linear model), L factor absorbed
+            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
+            semantic_Rate[i] = W * LK * epsilon
+            semantic_SE[i] = LK * epsilon
+            
+            # Semantic Energy Efficiency = Semantic Rate / (Transmission_Power + Circuit_Power)
+            # SEE = S / (P_tx + P_circuit)
             total_power = transmission_power_linear[i] + self.circuit_power
             if total_power > 0:
-                semantic_EE[i] = semantic_accuracy[i] / total_power
+                semantic_EE[i] = semantic_Rate[i] / total_power
+            else:
+                semantic_EE[i] = 0.0
         
         # Keep old metrics for backward compatibility
         cellular_Rate = np.zeros(self.n_Veh)
@@ -487,37 +515,60 @@ class Environ:
         collisions = np.zeros(self.n_Veh)  # No collision info in failure case
         
         return (cellular_Rate, cellular_SINR, SE, EE, 
-                semantic_accuracy, semantic_EE, collisions)
+                semantic_accuracy, semantic_EE, collisions,
+                semantic_Rate, semantic_SE)
 
     def compute_semantic_accuracy(self, rho, sinr):
         """
         Compute semantic accuracy (mAP) based on compression ratio and SINR
-        Formula: Accuracy = A_max * (1 - exp(-beta * rho)) * log(1 + SINR) / log(2)
+        Using Sigmoid model from paper: epsilon(gamma) = (A1 - A2) / (1 + exp(-(C1*gamma + C2))) + A2
+        
+        Combined with compression ratio: accuracy = compression_term * sigmoid_term
         
         Args:
             rho: Compression ratio [0, 1]
             sinr: Signal-to-Interference-plus-Noise Ratio (linear scale)
         
         Returns:
-            accuracy: Semantic accuracy (mAP) in [0, A_max]
+            accuracy: Semantic accuracy (mAP) in [A2, A1]
         """
         # Ensure rho is in [0, 1]
         rho = np.clip(rho, 0.0, 1.0)
         
         # Compression ratio term: (1 - exp(-beta * rho))
+        # This captures the effect of compression on accuracy
         compression_term = 1.0 - np.exp(-self.semantic_beta * rho)
         
-        # SINR term: log(1 + SINR) / log(2) to normalize to [0, 1] range approximately
-        # For better scaling, we use log(1 + SINR) / log(1 + max_SINR)
-        # Assuming max_SINR around 100 (20 dB), log(101) ≈ 4.6
-        max_sinr = 100.0  # Maximum expected SINR (linear)
-        sinr_term = np.log(1.0 + sinr) / np.log(1.0 + max_sinr)
-        sinr_term = np.clip(sinr_term, 0.0, 1.0)
+        # SINR term: Sigmoid model from paper
+        # epsilon(gamma) = (A1 - A2) / (1 + exp(-(C1*gamma + C2))) + A2
+        # This captures the effect of channel quality (SINR) on accuracy
+        sigmoid_term = (self.semantic_A1 - self.semantic_A2) / (1.0 + np.exp(-(self.semantic_C1 * sinr + self.semantic_C2))) + self.semantic_A2
+        sigmoid_term = np.clip(sigmoid_term, self.semantic_A2, self.semantic_A1)
         
-        # Combined accuracy
-        accuracy = self.semantic_A_max * compression_term * sinr_term
+        # Combined accuracy: compression and SINR effects are multiplicative
+        # Both high compression ratio and high SINR are needed for high accuracy
+        accuracy = compression_term * sigmoid_term
         
         return accuracy
+    
+    def compute_semantic_similarity(self, sinr):
+        """
+        Compute semantic similarity epsilon(gamma) using Sigmoid model
+        This is the SINR-dependent term without compression ratio effect
+        Used for semantic rate calculation: R^s = W * (L/K) * epsilon(gamma)
+        
+        Formula: epsilon(gamma) = (A1 - A2) / (1 + exp(-(C1*gamma + C2))) + A2
+        
+        Args:
+            sinr: Signal-to-Interference-plus-Noise Ratio (linear scale)
+        
+        Returns:
+            epsilon: Semantic similarity in [A2, A1]
+        """
+        # Sigmoid model from paper
+        epsilon = (self.semantic_A1 - self.semantic_A2) / (1.0 + np.exp(-(self.semantic_C1 * sinr + self.semantic_C2))) + self.semantic_A2
+        epsilon = np.clip(epsilon, self.semantic_A2, self.semantic_A1)
+        return epsilon
 
     def Compute_Performance_Reward_Train(self, actions_all, IS_PPO):
         """
@@ -614,6 +665,8 @@ class Environ:
         # ------------ Compute Semantic Communication Metrics --------------------
         semantic_accuracy = np.zeros(self.n_Veh)
         semantic_EE = np.zeros(self.n_Veh)
+        semantic_Rate = np.zeros(self.n_Veh)  # Semantic Rate R^s
+        semantic_SE = np.zeros(self.n_Veh)    # Semantic Spectral Efficiency
         transmission_power_linear = np.zeros(self.n_Veh)
         
         for i in range(len(self.vehicles)):
@@ -623,10 +676,30 @@ class Environ:
             # Compute semantic accuracy (mAP) based on compression ratio and SINR
             semantic_accuracy[i] = self.compute_semantic_accuracy(rho[i], cellular_SINR[i])
             
-            # Semantic Energy Efficiency = Accuracy / (Transmission_Power + Circuit_Power)
+            # Semantic Rate: R^s = W * (L/K) * epsilon(gamma)
+            # where L/K is semantic information density, modeled as L/K = rho
+            # epsilon(gamma) is semantic similarity (accuracy without compression term)
+            l = actions[i]
+            W = self.BW[l]  # Bandwidth in MHz
+
+            IK = rho[i]  # I/K = rho (linear model)
+            L_factor = 1.0  # L scaling factor (can be adjusted if needed)
+            
+            # epsilon(gamma): semantic similarity (Sigmoid model)
+            # This depends on K (number of symbols) and gamma (SINR)
+            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
+            
+            # Semantic Rate: S = W * (I/K) * L * epsilon(K,gamma)
+            semantic_Rate[i] = W * IK * L_factor * epsilon
+            
+            # Semantic Spectral Efficiency: Semantic-SE = S / W = (I/K) * L * epsilon(K,gamma)
+            semantic_SE[i] = IK * L_factor * epsilon
+            
+            # Semantic Energy Efficiency = Semantic Rate / (Transmission_Power + Circuit_Power)
+            # SEE = S / (P_tx + P_circuit), where S = W * (I/K) * L * epsilon(K,gamma)
             total_power = transmission_power_linear[i] + self.circuit_power
             if total_power > 0:
-                semantic_EE[i] = semantic_accuracy[i] / total_power
+                semantic_EE[i] = semantic_Rate[i] / total_power
             else:
                 semantic_EE[i] = 0.0
         
@@ -645,7 +718,8 @@ class Environ:
             EE[i] = np.divide(cellular_Rate[i], power_linear + self.circuit_power)
 
         return (cellular_Rate, cellular_SINR, SE, EE, 
-                semantic_accuracy, semantic_EE_penalized, collisions)
+                semantic_accuracy, semantic_EE_penalized, collisions,
+                semantic_Rate, semantic_SE)
 
     def Compute_Performance_Reward_Test_rand(self, actions_all, IS_PPO):
         if IS_PPO:
@@ -751,7 +825,7 @@ class Environ:
                 - actions[:, 2]: semantic compression ratio rho [0, 1]
             IS_PPO: bool or int, whether using PPO/DDPG format
         Returns:
-            reward: Semantic Energy Efficiency (mAP/Energy) with penalties
+            reward: Semantic Energy Efficiency sum (not average) for meta training
         """
         action_temp = actions.copy()
         # 兼容处理：确保IS_PPO参数被正确处理
@@ -760,16 +834,44 @@ class Environ:
         # Compute performance metrics (includes semantic communication metrics)
         results = self.Compute_Performance_Reward_Train(action_temp, is_ppo_mode)
         (cellular_Rate, cellular_SINR, SE, EE, 
-         semantic_accuracy, semantic_EE_penalized, collisions) = results
+         semantic_accuracy, semantic_EE, collisions,
+         semantic_Rate, semantic_SE) = results
         
-        # Use Semantic Energy Efficiency as reward
-        semantic_EE_sum = 0.0
+        # Get failure case metrics (low SINR scenario)
+        failure_results = self.Compute_Performance_Reward_Failure(action_temp, is_ppo_mode)
+        (_, _, failure_SE, _, _, failure_semantic_EE, _, _, _) = failure_results
+        
+        # Use Semantic-EE as reward (only optimize SEE)
+        # 与act_for_training保持一致的处理逻辑
+        SE_sum = 0.0  # Not used in reward calculation (kept for potential future use)
+        Semantic_EE_sum = 0.0
+        
+        # Training semantic similarity threshold (instead of SINR threshold)
+        # 使用语义相似度门限，更符合语义通信的特点
+        training_similarity_threshold = 0.5  # 语义相似度门限 [A2, A1] = [0.2, 1.0]
+        
+        # Three cases with different handling
         for i in range(len(self.success)):
-            if self.success[i] == 1:
-                semantic_EE_sum += semantic_EE_penalized[i]
+            # 计算语义相似度
+            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
+            
+            if (self.success[i] == 1) and (epsilon > training_similarity_threshold):
+                # Case 1: Success with good semantic similarity - use normal SE/EE
+                SE_sum += SE[i]
+                Semantic_EE_sum += semantic_EE[i]
+            elif (self.success[i] == 1):
+                # Case 2: Success but similarity not high enough - use failure SE/EE (smaller values)
+                SE_sum += failure_SE[i]
+                Semantic_EE_sum += failure_semantic_EE[i]
+            else:
+                # Case 3: Failure (collision) - apply penalty
+                Semantic_EE_sum = (np.sum(self.success) - self.n_Veh) / self.n_Veh
+                break
         
         # Return sum (not average) for meta training
-        reward = semantic_EE_sum
+        # 注意：meta训练返回sum，而普通训练返回average
+        # 如果需要缩放，可以在这里添加（但通常meta训练不需要，因为返回的是sum）
+        reward = Semantic_EE_sum
         return reward
 
     def act_for_training(self, actions, IS_PPO):
@@ -791,25 +893,37 @@ class Environ:
         # Compute performance metrics (includes semantic communication metrics)
         results = self.Compute_Performance_Reward_Train(action_temp, is_ppo_mode)
         (cellular_Rate, cellular_SINR, SE, EE, 
-         semantic_accuracy, semantic_EE, collisions) = results
+         semantic_accuracy, semantic_EE, collisions,
+         semantic_Rate, semantic_SE) = results
         
         # Get failure case metrics (low SINR scenario)
         failure_results = self.Compute_Performance_Reward_Failure(action_temp, is_ppo_mode)
-        (_, _, failure_SE, _, _, failure_semantic_EE, _) = failure_results
+        (_, _, failure_SE, _, _, failure_semantic_EE, _, _, _) = failure_results
         
-        # Use Semantic-EE as reward (similar to original EE)
-        SE_sum = 0.0
+        # Use Semantic-EE as reward (only optimize SEE)
+        SE_sum = 0.0  # Not used in reward calculation (kept for potential future use)
         Semantic_EE_sum = 0.0
         
-        # Training SINR threshold (same as original)
-        # Using 2.5 dB instead of 3.3 dB to allow more successful transmissions
-        # This is a safety margin: test threshold is 3.16 dB (linear: 2.07)
-        training_sinr_threshold = 2.5  # dB (linear: 1.78)
+        # Training semantic similarity threshold (instead of SINR threshold)
+        # 使用语义相似度门限，更符合语义通信的特点
+        # 语义相似度范围: [A2, A1] = [0.2, 1.0]
+        # 门限0.5表示中等相似度，对应SINR约2.5 dB
+        training_similarity_threshold = 0.5  # 语义相似度门限
         
-        # Original logic: three cases
+        # Initialize similarity_success for this step
+        self.similarity_success = np.zeros([self.n_Veh])
+        
+        # Simplified logic: two cases (Case 2 and Case 3 merged since they use same handling)
         for i in range(len(self.success)):
-            if (self.success[i] == 1) and (cellular_SINR[i] > training_sinr_threshold):
-                # Case 1: Success with good SINR - use normal SE/EE
+            # 计算语义相似度
+            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
+            
+            # Track similarity threshold achievement
+            if (self.success[i] == 1) and (epsilon > training_similarity_threshold):
+                self.similarity_success[i] = 1  # Both success and similarity threshold met
+            
+            if (self.success[i] == 1) and (epsilon > training_similarity_threshold):
+                # Case 1: Success with good semantic similarity - use normal SE/EE
                 SE_sum += SE[i]
                 Semantic_EE_sum += semantic_EE[i]
             elif (self.success[i] == 1):
@@ -817,30 +931,19 @@ class Environ:
                 SE_sum += failure_SE[i]
                 Semantic_EE_sum += failure_semantic_EE[i]
             else:
-                # Case 3: Failure (collision) - penalty
-                # Original code breaks here, but we accumulate to evaluate all UAVs
-                SE_sum += -1  # Failure penalty
-                Semantic_EE_sum += -1  # Failure penalty
-        
-        # Calculate reward based on optimization target (same as original)
-        if self.optimization_target == 'SE':
-            reward = SE_sum / self.n_Veh
-        elif self.optimization_target == 'EE':
-            # Use Semantic-EE instead of traditional EE
-            reward = Semantic_EE_sum / self.n_Veh
-        elif self.optimization_target == 'SE_EE':
-            # Weighted combination: beta * SE + (1-beta) * Semantic-EE
-            reward = (self.beta * SE_sum + (1 - self.beta) * Semantic_EE_sum) / self.n_Veh
-        else:
-            # Default to SE_EE
-            reward = (self.beta * SE_sum + (1 - self.beta) * Semantic_EE_sum) / self.n_Veh
+                # Case 3: Failure (collision) - apply penalty
+                Semantic_EE_sum = (np.sum(self.success) - self.n_Veh) / self.n_Veh
+                break
+
+        reward = Semantic_EE_sum / self.n_Veh
         
         return reward
 
     def act_for_testing(self, actions, IS_PPO):
 
         action_temp = actions.copy()
-        cellular_Rate, cellular_SINR, SE, EE = self.Compute_Performance_Reward_Train(action_temp, IS_PPO)
+        results = self.Compute_Performance_Reward_Train(action_temp, IS_PPO)
+        cellular_Rate, cellular_SINR, SE, EE, _, _, _, _, _ = results
         for i in range(len(cellular_Rate)):
             if (self.success[i] == 1) and (cellular_SINR [i] > 3.16):
                 SE[i] = SE[i]
@@ -854,7 +957,8 @@ class Environ:
     def act_for_testing_marl(self, actions, IS_PPO):
         done = True
         action_temp = actions.copy()
-        cellular_Rate, cellular_SINR, SE, EE = self.Compute_Performance_Reward_Train(action_temp, IS_PPO)
+        results = self.Compute_Performance_Reward_Train(action_temp, IS_PPO)
+        cellular_Rate, cellular_SINR, SE, EE, _, _, _, _, _ = results
         for i in range(len(cellular_Rate)):
             if (self.success[i] == 1) and  (cellular_SINR [i] > 3.16):
                 SE[i] = SE[i]

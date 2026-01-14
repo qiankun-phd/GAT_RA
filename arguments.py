@@ -200,17 +200,18 @@ def get_args():
         type=int,
         default=0,
         help='0: indoor, 1: cannon, 2: urban, 3: rural')
-    parser.add_argument(
-        '--optimization_target',
-        type=str,
-        default='SE_EE',
-        choices=['SE', 'EE', 'SE_EE'],
-        help='Optimization target: SE (Spectral Efficiency only), EE (Energy Efficiency only), or SE_EE (weighted combination, default)')
+    # optimization_target已固定为SE_EE，不再提供选择
+    # parser.add_argument(
+    #     '--optimization_target',
+    #     type=str,
+    #     default='SE_EE',
+    #     choices=['SE', 'EE', 'SE_EE'],
+    #     help='Optimization target: SE (Spectral Efficiency only), EE (Energy Efficiency only), or SE_EE (weighted combination, default)')
     parser.add_argument(
         '--beta',
         type=float,
         default=0.5,
-        help='Weight for SE in reward calculation when optimization_target=SE_EE (0.0-1.0), EE weight = 1 - beta (default: 0.5)')
+        help='Weight for SE in reward calculation (0.0-1.0), Semantic-EE weight = 1 - beta (default: 0.5). Reward = beta * SE + (1-beta) * Semantic-EE')
     parser.add_argument(
         '--circuit_power',
         type=float,
@@ -220,12 +221,32 @@ def get_args():
         '--semantic_A_max',
         type=float,
         default=1.0,
-        help='Maximum semantic accuracy (mAP) for semantic communication (default: 1.0)')
+        help='Maximum semantic accuracy (mAP) for semantic communication (default: 1.0, deprecated)')
     parser.add_argument(
         '--semantic_beta',
         type=float,
         default=2.0,
         help='Compression ratio sensitivity parameter for semantic accuracy (default: 2.0)')
+    parser.add_argument(
+        '--semantic_A1',
+        type=float,
+        default=1.0,
+        help='Upper bound of semantic accuracy in Sigmoid model (default: 1.0)')
+    parser.add_argument(
+        '--semantic_A2',
+        type=float,
+        default=0.2,
+        help='Lower bound of semantic accuracy in Sigmoid model (default: 0.2)')
+    parser.add_argument(
+        '--semantic_C1',
+        type=float,
+        default=5.0,
+        help='Slope parameter in Sigmoid model (default: 5.0)')
+    parser.add_argument(
+        '--semantic_C2',
+        type=float,
+        default=2.0,
+        help='Offset parameter in Sigmoid model (default: 2.0)')
     parser.add_argument(
         '--collision_penalty',
         type=float,

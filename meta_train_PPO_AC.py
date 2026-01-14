@@ -5,7 +5,7 @@ import os
 # import gym
 from meta_brain_PPO import PPO
 import matplotlib.pyplot as plt
-import Environment_marl_general
+from Environment_marl_indoor import Environ as Environment_marl_general
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 
@@ -63,22 +63,32 @@ ppoes = []
 envs = []
 sess = tf.Session(config=my_config)
 
-# Get SE/EE weighting parameters from config
-optimization_target = args.optimization_target if hasattr(args, 'optimization_target') else 'SE_EE'
+# 固定使用SEE优化目标（只优化语义能量效率）
+optimization_target = 'SEE'
 beta = args.beta if hasattr(args, 'beta') else 0.5
 circuit_power = args.circuit_power if hasattr(args, 'circuit_power') else 0.06
 
 for k in range(len(n_veh)):
-    env = Environment_marl_general.Environ(n_veh[k], n_RB, beta=beta, circuit_power=circuit_power, optimization_target=optimization_target)
+    env = Environment_marl_general(
+        n_veh[k], n_RB, 
+        beta=beta, 
+        circuit_power=circuit_power, 
+        optimization_target=optimization_target,
+        semantic_A1=1.0,
+        semantic_A2=0.2,
+        semantic_C1=5.0,
+        semantic_C2=2.0
+    )
     env.new_random_game()
     envs.append(env)
 
 T_TIMESTEPS = int(env.time_slow / (env.time_fast))
 state_dim = len(get_state(env=env))
-action_dim = 2  # RB_choice + power
+action_dim = 3  # RB_choice + power + rho (compression ratio)
 action_bound = []
-action_bound.append(n_RB)
-action_bound.append(args.RB_action_bound)
+action_bound.append(n_RB)  # RB bound
+action_bound.append(args.RB_action_bound)  # Power bound
+# 注意：rho使用Beta分布，范围固定为[0,1]，不需要action_bound
 
 ppo = PPO(state_dim, action_bound, args.weight_for_L_vf, args.weight_for_entropy, args.epsilon, args.lr_meta_a, args.lr_meta_c, args.minibatch_steps, n_RB, sess)
 
@@ -108,19 +118,26 @@ def simulate():
             action_all = []
             v_pred_all = []
             reward_all = []
-            action_all_training = np.zeros([n_veh[k], 2], dtype='float32')
+            action_all_training = np.zeros([n_veh[k], 3], dtype='float32')
 
             for i in range(n_veh[k]):
                 action = ppo.choose_action(state_all[i], sess)
                 v_pred = ppo.get_v(state_all[i], sess).tolist()
                 action_all.append(action)
-                v_pred_all.append(v_pred)
 
                 channel_action = action[0]
-                amp = envs[k].cellular_power_dB_List[0] / (2 * action_bound[-1])
-                power_action = (action[-1] + action_bound[-1]) * amp
+                amp = envs[k].cellular_power_dB_List[0] / (2 * action_bound[1])
+                power_action = (action[1] + action_bound[1]) * amp
+                # 压缩比rho：从action的第3维获取（PPO网络已输出）
+                rho_action = action[2]  # 已经是[0,1]范围内的值（Beta分布输出）
+                # 确保rho在[0, 1]范围内（双重保险）
+                rho_action = np.clip(rho_action, 0.0, 1.0)
+                
                 action_all_training[i, 0] = channel_action
                 action_all_training[i, 1] = power_action
+                action_all_training[i, 2] = rho_action
+                
+                v_pred_all.append(v_pred)
             action_temp = action_all_training.copy()
             train_reward = envs[k].act_for_meta_training(action_temp, IS_PPO)
             for i in range(n_veh[k]):
@@ -145,7 +162,12 @@ def simulate():
 
         gaes = ppo.get_gaes(rewards=rewards, v_preds=v_pred_alls, v_preds_next=v_preds_next)
         gaes = np.array(gaes).astype(dtype=np.float32)
-        gaes = (gaes - gaes.mean()) / gaes.std()
+        # 归一化GAE，添加epsilon防止除以0（当所有GAE值相同时）
+        gaes_mean = gaes.mean()
+        gaes_std = gaes.std()
+        if gaes_std > 1e-8:
+            gaes = (gaes - gaes_mean) / gaes_std
+        # 如果所有GAE值相同（std=0），保持原值不变（不归一化）
 
         state_alls = np.reshape(state_alls, newshape=(-1, n_veh[k], state_dim))
         action_alls = np.reshape(action_alls, newshape=(-1, n_veh[k], action_dim))
@@ -200,12 +222,9 @@ for i in range(meta_episode):
     loss_episode.append(sum(loss_batch) / BATCH_SIZE)
     print('Loss_episode: ', loss_episode[-1])
 
-# 构建模型路径，包含优化目标信息
-opt_target_str = optimization_target.replace('_', '&')  # SE_EE -> SE&EE
-if optimization_target == 'SE_EE':
-    opt_suffix = f'{opt_target_str}_{beta:.2f}'  # SE&EE_0.50
-else:
-    opt_suffix = opt_target_str  # SE 或 EE
+# 构建模型路径，包含优化目标信息（固定为SEE）
+opt_target_str = optimization_target  # SEE
+opt_suffix = opt_target_str  # SEE（不再需要beta参数）
 
 model_path = args.save_path + 'AC_' + opt_suffix + '_' + '%s_' %sigma_add + '%d_' % meta_episode +'%s_' %args.lr_meta_a
 save_models(sess, model_path, ppo.saver)

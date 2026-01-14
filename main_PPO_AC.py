@@ -32,14 +32,20 @@ IS_FL = args.Do_FL
 n_veh = args.n_veh
 n_RB = args.n_RB
 
-# Get SE/EE weighting parameters from config
-optimization_target = args.optimization_target if hasattr(args, 'optimization_target') else 'SE_EE'
+# 固定使用SEE优化目标（只优化Semantic-EE）
+optimization_target = 'SEE'
+# beta参数已废弃，不再使用（保留仅为了向后兼容）
 beta = args.beta if hasattr(args, 'beta') else 0.5
 circuit_power = args.circuit_power if hasattr(args, 'circuit_power') else 0.06
 
 # Get semantic communication parameters
 semantic_A_max = args.semantic_A_max if hasattr(args, 'semantic_A_max') else 1.0
 semantic_beta = args.semantic_beta if hasattr(args, 'semantic_beta') else 2.0
+# Sigmoid model parameters
+semantic_A1 = args.semantic_A1 if hasattr(args, 'semantic_A1') else 1.0
+semantic_A2 = args.semantic_A2 if hasattr(args, 'semantic_A2') else 0.2
+semantic_C1 = args.semantic_C1 if hasattr(args, 'semantic_C1') else 5.0
+semantic_C2 = args.semantic_C2 if hasattr(args, 'semantic_C2') else 2.0
 
 env_indoor = Environment_marl_indoor.Environ(
     n_veh, n_RB, 
@@ -47,7 +53,11 @@ env_indoor = Environment_marl_indoor.Environ(
     circuit_power=circuit_power, 
     optimization_target=optimization_target,
     semantic_A_max=semantic_A_max,
-    semantic_beta=semantic_beta
+    semantic_beta=semantic_beta,
+    semantic_A1=semantic_A1,
+    semantic_A2=semantic_A2,
+    semantic_C1=semantic_C1,
+    semantic_C2=semantic_C2
 )
 
 env_choice = args.env_choice
@@ -77,48 +87,6 @@ def get_state(env, idx=(0, 0), n_veh=0, ind_episode=0.):
     return np.concatenate((np.reshape(cellular_fast, -1), np.reshape(cellular_abs, -1), np.reshape(channel_choice, -1), vehicle_vector,
                            np.asarray([success, ind_episode / (n_episode)])))
 
-def get_graph_data(env, n_veh, ind_episode=0.):
-    """
-    Get graph data for GAT mode
-    Returns:
-        node_features: [n_veh, node_feature_dim] node features
-        adj_matrix: [n_veh, n_veh] adjacency matrix
-    """
-    node_features = []
-    
-    for i in range(n_veh):
-        # CSI fast fading (normalized)
-        cellular_fast = (env.cellular_channels_with_fastfading[i, :] - env.cellular_channels_abs[i] + 10) / 35
-        # CSI slow fading (normalized)
-        cellular_abs = (env.cellular_channels_abs[i] - 80) / 60.0
-        # Position (normalized)
-        position = env.vehicles[i].position
-        pos_normalized = [
-            position[0] / env.width,  # x
-            position[1] / env.height,  # y
-            position[2] / (env.height_max - env.height_min) if hasattr(env, 'height_max') else position[2] / 200.0  # z
-        ]
-        # Success flag
-        success = env.success[i]
-        # Episode progress
-        episode_progress = ind_episode / n_episode
-        
-        # Concatenate node features
-        node_feat = np.concatenate([
-            cellular_fast,  # [n_RB]
-            cellular_abs,   # [n_RB]
-            pos_normalized,  # [3]
-            [success],      # [1]
-            [episode_progress]  # [1]
-        ])
-        node_features.append(node_feat)
-    
-    node_features = np.array(node_features)  # [n_veh, node_feature_dim]
-    
-    # Get adjacency matrix
-    adj_matrix = env.get_adjacency_matrix()  # [n_veh, n_veh]
-    
-    return node_features, adj_matrix
 
 def save_models(sess, model_path, saver):
     """ Save models to the current directory with the name filename """
@@ -137,9 +105,11 @@ action_bound.append(1.0)  # rho ∈ [0, 1]
 
 ppoes = []
 # Get GAT parameters
-use_gat = args.use_gat if hasattr(args, 'use_gat') else False
+use_gat = False
+if hasattr(args, 'use_gat') and args.use_gat:
+    print("[WARN] 本版本已移除 PPO 内的 GAT 编码器实现，将强制 use_gat=False（继续使用 MLP）。")
 num_gat_heads = args.num_gat_heads if hasattr(args, 'num_gat_heads') else 4
-node_feature_dim = None  # Will be computed automatically if None
+node_feature_dim = None  # (GAT已移除) 保留占位以兼容旧参数
 
 ppoes = PPO(state_dim, action_bound, args.weight_for_L_vf, args.weight_for_entropy, args.epsilon, 
             args.lr_main, args.lr_meta_a, args.minibatch_steps, n_veh, n_RB, IS_meta, meta_episode,
@@ -155,6 +125,7 @@ def simulate():
     r_sum = 0
     trans_all_user = []
     success_alls = []
+    similarity_success_alls = []  # Track similarity threshold achievement
     state_alls = []
     action_alls = []
     v_pred_alls = []
@@ -221,6 +192,7 @@ def simulate():
                 state_ = get_state(env, [i, 0], n_veh, i_episode)
                 state_all[i] = state_
         success_all = env.success
+        similarity_success_all = env.similarity_success  # Get similarity threshold achievement
         r_sum += train_reward
 
         if not use_gat:
@@ -229,6 +201,7 @@ def simulate():
         v_pred_alls = np.append(v_pred_alls, np.asarray(v_pred_all))
         rewards = np.append(rewards, np.asarray(reward_all))
         success_alls = np.append(success_alls, np.asarray(success_all))
+        similarity_success_alls = np.append(similarity_success_alls, np.asarray(similarity_success_all))
         v_preds_next = v_pred_alls
 
     # Normalize rewards only if std > threshold (avoid dividing by zero)
@@ -243,6 +216,7 @@ def simulate():
     v_pred_alls = v_pred_alls.reshape([-1, n_veh])
     v_preds_next = v_preds_next.reshape([-1, n_veh])
     success_alls = success_alls.reshape([-1, n_veh])
+    similarity_success_alls = similarity_success_alls.reshape([-1, n_veh])  # Reshape similarity success
 
     gaes = ppoes.get_gaes(rewards=rewards, v_preds=v_pred_alls, v_preds_next=v_preds_next)
 
@@ -260,27 +234,22 @@ def simulate():
     
     action_alls = np.reshape(action_alls, newshape=(-1, n_veh, action_dim))
     gaes = np.array(gaes).astype(dtype=np.float32)
-    # Normalize GAE, but handle case where all values are the same (std=0)
-    gae_std = gaes.std()
-    if gae_std > 1e-8:
-        gaes = (gaes - gaes.mean()) / gae_std
-    else:
-        # If all GAE values are the same, don't normalize (keep original values)
-        # This can happen in GAT mode if all batch samples produce same outputs
-        pass
+    gaes = (gaes - gaes.mean()) / gaes.std()
 
     if use_gat:
         trans_all_user = [state_alls, action_alls, gaes, rewards, v_preds_next, node_features_batch, adj_matrix_batch]
     else:
         trans_all_user = [state_alls, action_alls, gaes, rewards, v_preds_next]
 
-    return r_sum / T_TIMESTEPS, trans_all_user, success_alls.sum(axis=0) / T_TIMESTEPS
+    success_rate = success_alls.sum(axis=0) / T_TIMESTEPS
+    similarity_rate = similarity_success_alls.sum(axis=0) / T_TIMESTEPS  # Calculate similarity threshold achievement rate
+    return r_sum / T_TIMESTEPS, trans_all_user, success_rate, similarity_rate
 
 record_reward = []
 loss_episode = []
 
 # 初始化TensorBoard
-opt_target_str = optimization_target.replace('_', '&')
+opt_target_str = "SEE"  # 固定为SEE（Semantic-EE）
 algorithm_str = "MAPPO"
 
 if IS_FL and IS_meta:
@@ -295,8 +264,9 @@ else:
 log_name_parts = [opt_target_str, algorithm_str]
 if training_mode:
     log_name_parts.append(training_mode)
-if optimization_target == 'SE_EE':
-    log_name_parts.append(f"A{semantic_A_max}_beta{semantic_beta}")
+# 添加语义参数到日志名（不再包含reward beta，因为只优化SEE）
+# 格式: Amax1.0_semB2.0 (语义A_max, 语义beta)
+log_name_parts.append(f"Amax{semantic_A_max}_semB{semantic_beta}")
 log_name_parts.append(f"UAV{n_veh}_RB{n_RB}")
 log_name = "_".join(log_name_parts)
 
@@ -313,11 +283,11 @@ for episode_idx in range(n_episode):
     concurrent.futures.wait(futures)
     r_avgs = []
     for f in futures:
-        r_avg, trans_all_user, success_rate = f.result()
+        r_avg, trans_all_user, success_rate, similarity_rate = f.result()
         r_avgs.append(r_avg)
     record_reward.append(sum(r_avgs))
 
-    print('Episode:', episode_idx, 'Sum Reward', r_avg, 'Success Rate', success_rate)
+    print('Episode:', episode_idx, 'Sum Reward', r_avg, 'Success Rate', success_rate, 'Similarity Rate', similarity_rate)
     loss_batch = []
     sample_indices = np.random.randint(low=0, high=trans_all_user[0].shape[0], size=BATCH_SIZE)
     sampled_inp = [np.take(a=a, indices=sample_indices, axis=0) for a in trans_all_user]
@@ -371,251 +341,13 @@ for episode_idx in range(n_episode):
     else:
         summary.value.add(tag='Metrics/success_rate', simple_value=float(success_rate))
     
-    writer.add_summary(summary, i_episode)
-    writer.flush()
-
-    if i_episode == int(n_episode / 2):
-        label_early = '%d_' % target_average_step + '%d_' % n_veh + '%d_' % i_episode + '%s_' %args.lr_main + '%s_' %args.sigma_add + '%s_' %env_label
-        if IS_meta:
-            np.savetxt('./Train_data/Reward_AC_'+'%d_' %meta_episode+ label_early, record_reward)
-            np.savetxt('./Train_data/loss_AC_'+'%d_' %meta_episode+ label_early, loss_episode)
-            ppoes.save_models('PPO_AC_' +'%d_' %meta_episode+ label_early)
-        else:
-            np.savetxt('./Train_data/Reward_no_meta_AC_' + label_early, record_reward)
-            np.savetxt('./Train_data/loss_no_meta_AC_' + label_early, loss_episode)
-            ppoes.save_models('PPO_no_meta_AC_' + label_early)
-
-    # 联邦学习：模型平均
-    if IS_FL and i_episode % target_average_step == target_average_step - 1 and i_episode < 0.9 * n_episode:
-        print('Model averaged ' + '%d' % current_fed_times)
-        current_fed_times = current_fed_times + 1
-        ppoes.averaging_model(success_rate)
-
-label_base = '%d_' %target_average_step+ '%d_' %n_veh + '%d_' %n_episode + '%s_' %args.lr_main + '%s_' %args.sigma_add + '%s_' %env_label
-if IS_meta:
-    np.savetxt('./Train_data/Reward_AC_'+'%d_' %meta_episode+ label_base, record_reward)
-    np.savetxt('./Train_data/loss_AC_'+'%d_' %meta_episode+ label_base, loss_episode)
-    ppoes.save_models('PPO_AC_' +'%d_' %meta_episode+ label_base)
-else:
-    np.savetxt('./Train_data/Reward_no_meta_AC_'+ label_base, record_reward)
-    np.savetxt('./Train_data/loss_no_meta_AC_'+ label_base, loss_episode)
-    ppoes.save_models('PPO_no_meta_AC_' + label_base)
-
-writer.close()
-print(f"\n训练完成！TensorBoard日志已保存到: {log_dir}")
-print(f"查看TensorBoard: tensorboard --logdir=./logs/tensorboard --port=6008")
-
-
-if IS_FL and IS_meta:
-    training_mode = "MFRL"
-elif IS_FL:
-    training_mode = "FRL"
-elif IS_meta:
-    training_mode = "MRL"
-else:
-    training_mode = "RL"
-
-log_name_parts = [opt_target_str, algorithm_str]
-if training_mode:
-    log_name_parts.append(training_mode)
-if optimization_target == 'SE_EE':
-    log_name_parts.append(f"A{semantic_A_max}_beta{semantic_beta}")
-log_name_parts.append(f"UAV{n_veh}_RB{n_RB}")
-log_name = "_".join(log_name_parts)
-
-log_dir = f'./logs/tensorboard/{log_name}'
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-writer = tf.summary.FileWriter(log_dir)
-print(f"TensorBoard日志目录: {log_dir}")
-print(f"启动TensorBoard: tensorboard --logdir=./logs/tensorboard --port=6008")
-
-for episode_idx in range(n_episode):
-    i_episode = i_episode + 1
-    futures = [executor.submit(simulate) for _ in range(ACTOR_NUM)]
-    concurrent.futures.wait(futures)
-    r_avgs = []
-    for f in futures:
-        r_avg, trans_all_user, success_rate = f.result()
-        r_avgs.append(r_avg)
-    record_reward.append(sum(r_avgs))
-
-    print('Episode:', episode_idx, 'Sum Reward', r_avg, 'Success Rate', success_rate)
-    loss_batch = []
-    sample_indices = np.random.randint(low=0, high=trans_all_user[0].shape[0], size=BATCH_SIZE)
-    sampled_inp = [np.take(a=a, indices=sample_indices, axis=0) for a in trans_all_user]
-
-    loss_all = []
-    policy_losses = []
-    vf_losses = []
-    entropies = []
-
-    for agent_idx in range(n_veh):
-        s = sampled_inp[0][:, agent_idx, :]
-        a = sampled_inp[1][:, agent_idx, :]
-        gae = sampled_inp[2][:, agent_idx]
-        reward = sampled_inp[3][:, agent_idx]
-        v_pred_next = sampled_inp[4][:, agent_idx]
-
-        if use_gat:
-            # GAT mode: pass graph data
-            node_features_batch = sampled_inp[5]  # [batch_size, n_veh, node_feature_dim]
-            adj_matrix_batch = sampled_inp[6]  # [batch_size, n_veh, n_veh]
-            # Debug: check data shapes and values
-            if agent_idx == 0 and episode_idx < 2:
-                print(f"DEBUG Training: reward shape={reward.shape}, reward sample={reward[:3]}, "
-                      f"v_pred_next shape={v_pred_next.shape}, v_pred_next sample={v_pred_next[:3]}, "
-                      f"gae shape={gae.shape}, gae sample={gae[:3]}")
-            loss = ppoes.train(s, a, gae, reward, v_pred_next, ppoes.sesses[agent_idx],
-                             node_features=node_features_batch, adj_matrix=adj_matrix_batch, agent_idx=agent_idx)
-        else:
-            # MLP mode: use state only
-            loss = ppoes.train(s, a, gae, reward, v_pred_next, ppoes.sesses[agent_idx])
-        # loss[0] = [L_clip, L_RB, L_rho, L_vf, S]
-        if len(loss[0]) >= 5:
-            policy_losses.append(loss[0][0] + loss[0][1] + loss[0][2])  # L_clip + L_RB + L_rho
-            vf_losses.append(loss[0][3])  # L_vf
-            entropies.append(loss[0][4])  # S
-        loss_all.append(loss[1])
-    loss_batch.append(sum(loss_all))
-    loss_episode.append(sum(loss_batch)/BATCH_SIZE)
-    print('Loss_episode: ', loss_episode[-1])
-    
-    # 记录到TensorBoard
-    summary = tf.Summary()
-    summary.value.add(tag='Train/reward', simple_value=float(r_avg)*6)
-    summary.value.add(tag='Train/Loss_episode', simple_value=float(loss_episode[-1]))
-    
-    # Success Rate
-    if isinstance(success_rate, np.ndarray):
-        summary.value.add(tag='Metrics/success_rate_mean', simple_value=float(np.mean(success_rate)))
-        for idx, rate in enumerate(success_rate):
-            summary.value.add(tag=f'Metrics/success_rate_ue_{idx}', simple_value=float(rate))
+    # Similarity Threshold Achievement Rate
+    if isinstance(similarity_rate, np.ndarray):
+        summary.value.add(tag='Metrics/similarity_rate_mean', simple_value=float(np.mean(similarity_rate)))
+        for idx, rate in enumerate(similarity_rate):
+            summary.value.add(tag=f'Metrics/similarity_rate_ue_{idx}', simple_value=float(rate))
     else:
-        summary.value.add(tag='Metrics/success_rate', simple_value=float(success_rate))
-    
-    writer.add_summary(summary, i_episode)
-    writer.flush()
-
-    if i_episode == int(n_episode / 2):
-        label_early = '%d_' % target_average_step + '%d_' % n_veh + '%d_' % i_episode + '%s_' %args.lr_main + '%s_' %args.sigma_add + '%s_' %env_label
-        if IS_meta:
-            np.savetxt('./Train_data/Reward_AC_'+'%d_' %meta_episode+ label_early, record_reward)
-            np.savetxt('./Train_data/loss_AC_'+'%d_' %meta_episode+ label_early, loss_episode)
-            ppoes.save_models('PPO_AC_' +'%d_' %meta_episode+ label_early)
-        else:
-            np.savetxt('./Train_data/Reward_no_meta_AC_' + label_early, record_reward)
-            np.savetxt('./Train_data/loss_no_meta_AC_' + label_early, loss_episode)
-            ppoes.save_models('PPO_no_meta_AC_' + label_early)
-
-    # 联邦学习：模型平均
-    if IS_FL and i_episode % target_average_step == target_average_step - 1 and i_episode < 0.9 * n_episode:
-        print('Model averaged ' + '%d' % current_fed_times)
-        current_fed_times = current_fed_times + 1
-        ppoes.averaging_model(success_rate)
-
-label_base = '%d_' %target_average_step+ '%d_' %n_veh + '%d_' %n_episode + '%s_' %args.lr_main + '%s_' %args.sigma_add + '%s_' %env_label
-if IS_meta:
-    np.savetxt('./Train_data/Reward_AC_'+'%d_' %meta_episode+ label_base, record_reward)
-    np.savetxt('./Train_data/loss_AC_'+'%d_' %meta_episode+ label_base, loss_episode)
-    ppoes.save_models('PPO_AC_' +'%d_' %meta_episode+ label_base)
-else:
-    np.savetxt('./Train_data/Reward_no_meta_AC_'+ label_base, record_reward)
-    np.savetxt('./Train_data/loss_no_meta_AC_'+ label_base, loss_episode)
-    ppoes.save_models('PPO_no_meta_AC_' + label_base)
-
-writer.close()
-print(f"\n训练完成！TensorBoard日志已保存到: {log_dir}")
-print(f"查看TensorBoard: tensorboard --logdir=./logs/tensorboard --port=6008")
-
-
-if IS_FL and IS_meta:
-    training_mode = "MFRL"
-elif IS_FL:
-    training_mode = "FRL"
-elif IS_meta:
-    training_mode = "MRL"
-else:
-    training_mode = "RL"
-
-log_name_parts = [opt_target_str, algorithm_str]
-if training_mode:
-    log_name_parts.append(training_mode)
-if optimization_target == 'SE_EE':
-    log_name_parts.append(f"A{semantic_A_max}_beta{semantic_beta}")
-log_name_parts.append(f"UAV{n_veh}_RB{n_RB}")
-log_name = "_".join(log_name_parts)
-
-log_dir = f'./logs/tensorboard/{log_name}'
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-writer = tf.summary.FileWriter(log_dir)
-print(f"TensorBoard日志目录: {log_dir}")
-print(f"启动TensorBoard: tensorboard --logdir=./logs/tensorboard --port=6008")
-
-for episode_idx in range(n_episode):
-    i_episode = i_episode + 1
-    futures = [executor.submit(simulate) for _ in range(ACTOR_NUM)]
-    concurrent.futures.wait(futures)
-    r_avgs = []
-    for f in futures:
-        r_avg, trans_all_user, success_rate = f.result()
-        r_avgs.append(r_avg)
-    record_reward.append(sum(r_avgs))
-
-    print('Episode:', episode_idx, 'Sum Reward', r_avg, 'Success Rate', success_rate)
-    loss_batch = []
-    sample_indices = np.random.randint(low=0, high=trans_all_user[0].shape[0], size=BATCH_SIZE)
-    sampled_inp = [np.take(a=a, indices=sample_indices, axis=0) for a in trans_all_user]
-
-    loss_all = []
-    policy_losses = []
-    vf_losses = []
-    entropies = []
-
-    for agent_idx in range(n_veh):
-        s = sampled_inp[0][:, agent_idx, :]
-        a = sampled_inp[1][:, agent_idx, :]
-        gae = sampled_inp[2][:, agent_idx]
-        reward = sampled_inp[3][:, agent_idx]
-        v_pred_next = sampled_inp[4][:, agent_idx]
-
-        if use_gat:
-            # GAT mode: pass graph data
-            node_features_batch = sampled_inp[5]  # [batch_size, n_veh, node_feature_dim]
-            adj_matrix_batch = sampled_inp[6]  # [batch_size, n_veh, n_veh]
-            # Debug: check data shapes and values
-            if agent_idx == 0 and episode_idx < 2:
-                print(f"DEBUG Training: reward shape={reward.shape}, reward sample={reward[:3]}, "
-                      f"v_pred_next shape={v_pred_next.shape}, v_pred_next sample={v_pred_next[:3]}, "
-                      f"gae shape={gae.shape}, gae sample={gae[:3]}")
-            loss = ppoes.train(s, a, gae, reward, v_pred_next, ppoes.sesses[agent_idx],
-                             node_features=node_features_batch, adj_matrix=adj_matrix_batch, agent_idx=agent_idx)
-        else:
-            # MLP mode: use state only
-            loss = ppoes.train(s, a, gae, reward, v_pred_next, ppoes.sesses[agent_idx])
-        # loss[0] = [L_clip, L_RB, L_rho, L_vf, S]
-        if len(loss[0]) >= 5:
-            policy_losses.append(loss[0][0] + loss[0][1] + loss[0][2])  # L_clip + L_RB + L_rho
-            vf_losses.append(loss[0][3])  # L_vf
-            entropies.append(loss[0][4])  # S
-        loss_all.append(loss[1])
-    loss_batch.append(sum(loss_all))
-    loss_episode.append(sum(loss_batch)/BATCH_SIZE)
-    print('Loss_episode: ', loss_episode[-1])
-    
-    # 记录到TensorBoard
-    summary = tf.Summary()
-    summary.value.add(tag='Train/reward', simple_value=float(r_avg)*6)
-    summary.value.add(tag='Train/Loss_episode', simple_value=float(loss_episode[-1]))
-    
-    # Success Rate
-    if isinstance(success_rate, np.ndarray):
-        summary.value.add(tag='Metrics/success_rate_mean', simple_value=float(np.mean(success_rate)))
-        for idx, rate in enumerate(success_rate):
-            summary.value.add(tag=f'Metrics/success_rate_ue_{idx}', simple_value=float(rate))
-    else:
-        summary.value.add(tag='Metrics/success_rate', simple_value=float(success_rate))
+        summary.value.add(tag='Metrics/similarity_rate', simple_value=float(similarity_rate))
     
     writer.add_summary(summary, i_episode)
     writer.flush()
