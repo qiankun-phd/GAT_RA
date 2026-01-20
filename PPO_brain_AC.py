@@ -49,6 +49,7 @@ class PPO(object):
         self.n_RB = n_RB
         self.n_veh = n_veh
         self.IS_meta = IS_meta
+        self.meta_episode = meta_episode  # Save meta_episode as instance variable
         self.gamma = args.gamma
         self.GAE_discount = args.lambda_advantage
         if use_gat:
@@ -77,8 +78,10 @@ class PPO(object):
         # MLP mode: original simple logic
         power_prob = pi.prob(power_action)
         old_power_prob = old_pi.prob(power_action)
-        rho_prob = rho_distribution.prob(rho_action)
-        old_rho_prob = old_rho_distribution.prob(rho_action)
+        # rho使用Normal分布，需要clip到[0,1]范围后再计算概率
+        rho_action_clipped = tf.clip_by_value(rho_action, 0.0, 1.0)
+        rho_prob = rho_distribution.prob(rho_action_clipped)
+        old_rho_prob = old_rho_distribution.prob(rho_action_clipped)
         
         # Original code style: simple ratio calculation with numerical stability
         # Add small epsilon to prevent division by zero
@@ -146,10 +149,13 @@ class PPO(object):
         self.Entropy_value = S
         
         # Sample actions (MLP mode)
+        # 对于rho，采样后需要clip到[0,1]范围（因为使用Normal分布）
+        rho_sample = tf.squeeze(rho_distribution.sample(1), axis=0)
+        rho_sample = tf.clip_by_value(rho_sample, 0.0, 1.0)  # 确保rho在[0,1]范围内
         self.choose_action_op = tf.concat([
             tf.transpose(tf.cast(RB_distribution.sample(1), dtype=tf.float32)),
             tf.squeeze(pi.sample(1), axis=0),
-            tf.squeeze(rho_distribution.sample(1), axis=0)
+            rho_sample
         ], 1)
 
         # Optimizer (original code style)
@@ -167,33 +173,64 @@ class PPO(object):
             optimization_target = 'SEE'
             
             # Meta训练保存格式: AC_SEE_{sigma_add}_{meta_episode}_{lr_meta_a}
-            # 不再使用beta参数（已废弃）
+            # 与backup版本的区别：backup版本格式为 AC_{sigma_add}_{meta_episode}_{lr_meta_a}（无SEE）
+            # 当前版本格式为 AC_SEE_{sigma_add}_{meta_episode}_{lr_meta_a}（有SEE）
             opt_suffix = optimization_target  # 直接使用'SEE'
             
+            # 使用实例变量self.meta_episode和args中的参数
             for i in range(self.n_veh):
-                meta_save_path = 'meta_model_'
-                model_path = meta_save_path + 'AC_' + opt_suffix + '_' + '%s_' %sigma_add + '%d_' % meta_episode +'%s_' %args.lr_meta_a
+                meta_save_path = args.save_path  # 使用args.save_path，默认是'meta_model_'
+                model_path = meta_save_path + 'AC_' + opt_suffix + '_' + '%s_' %sigma_add + '%d_' % self.meta_episode +'%s_' %args.lr_meta_a
                 print(f"Loading meta model for agent {i}: {model_path}")
+                print(f"  Expected path format: {model_path}")
                 self.load_models(self.sesses[i], model_path, self.saver)
 
     def load_models(self, sess, model_path, saver):
         """ Restore models from the current directory with the name filename """
         dir_ = os.path.dirname(os.path.realpath(__file__))
-        model_path = os.path.join(dir_, "model/" + model_path)
-        if os.path.exists(model_path + '.index'):
+        full_model_path = os.path.join(dir_, "model/" + model_path)
+        
+        # Check if model file exists
+        if os.path.exists(full_model_path + '.index'):
             try:
-                saver.restore(sess, model_path)
-                print(f"✅ Successfully loaded model: {model_path}")
+                saver.restore(sess, full_model_path)
+                print(f"✅ Successfully loaded model: {full_model_path}")
             except Exception as e:
-                print(f"❌ Failed to load model: {model_path}")
-                print(f"   Error: {e}")
-                print(f"   This may be due to shape mismatch between saved model and current network structure.")
-                print(f"   The saved model may have been trained with a different network structure.")
-                print(f"   Suggestion: Re-train the meta model with the current code version.")
-                # 不抛出异常，让训练继续（使用随机初始化的权重）
-                print(f"   Continuing with randomly initialized weights...")
+                error_str = str(e)
+                # 检查是否是形状不匹配错误（旧模型没有rho参数）
+                if "shape mismatch" in error_str.lower() or "Assign requires shapes" in error_str:
+                    print(f"⚠️  Shape mismatch detected!")
+                    print(f"   The saved meta model was trained with OLD code (without rho/compression ratio parameters).")
+                    print(f"   Current code requires rho parameters, so the model cannot be loaded.")
+                    print(f"")
+                    print(f"   SOLUTION: Re-train the meta model with current code:")
+                    print(f"   python meta_train_PPO_AC.py --n_veh_list 2,4,8 --n_RB 10 --sigma_add 0.3 --meta_episode 100 --lr_meta_a 5e-7 --lr_meta_c 1e-5")
+                    print(f"")
+                    print(f"   Continuing with randomly initialized weights (no meta model loaded)...")
+                else:
+                    print(f"❌ Failed to load model: {full_model_path}")
+                    print(f"   Error: {e}")
+                    print(f"   Please re-train the meta model using current code.")
+                    print(f"   Continuing with randomly initialized weights...")
         else:
-            print(f"Warning: Model path {model_path} does not exist, skipping load.")
+            print(f"⚠️  Warning: Model file does not exist: {full_model_path}")
+            print(f"   Looking for: {full_model_path}.index")
+            
+            # 尝试兼容backup版本的路径格式（无SEE后缀）
+            if 'AC_SEE_' in model_path:
+                backup_model_path = model_path.replace('AC_SEE_', 'AC_')
+                backup_full_path = os.path.join(dir_, "model/" + backup_model_path)
+                if os.path.exists(backup_full_path + '.index'):
+                    try:
+                        saver.restore(sess, backup_full_path)
+                        print(f"✅ Successfully loaded model (backup format): {backup_full_path}")
+                        return
+                    except Exception as e:
+                        print(f"   Also tried backup format but failed: {backup_full_path}")
+            
+            print(f"   Please train the meta model first:")
+            print(f"   python meta_train_PPO_AC.py --n_veh_list 2,4,8 --n_RB 10 --sigma_add 0.3 --meta_episode 100 --lr_meta_a 5e-7 --lr_meta_c 1e-5")
+            print(f"   Continuing with randomly initialized weights...")
 
     def save_model(self, sess, model_path, saver):
         """ Save models to the current directory with the name filename """
@@ -217,13 +254,29 @@ class PPO(object):
             initializer = tf.compat.v1.keras.initializers.he_normal()
 
             # MLP encoder
+            # 注意：变量创建顺序必须与meta_brain_PPO.py完全一致，否则无法加载meta模型
+            # 顺序：所有weights先创建，然后所有biases
             self.w_1 = tf.Variable(initializer(shape=(self.s_dim, n_hidden_1)), trainable=trainable)
             self.w_2 = tf.Variable(initializer(shape=(n_hidden_1, n_hidden_2)), trainable=trainable)
             self.w_3 = tf.Variable(initializer(shape=(n_hidden_2, n_hidden_3)), trainable=trainable)
+            self.w_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_RB = tf.Variable(initializer(shape=(n_hidden_2, self.n_RB)), trainable=trainable)
+            # 新增：rho的网络参数（Normal分布，与power相同）
+            self.w_rho_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_rho_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_v = tf.Variable(initializer(shape=(n_hidden_3, 1)), trainable=trainable)
 
             self.b_1 = tf.Variable(tf.truncated_normal([n_hidden_1], stddev=0.1), trainable=trainable)
             self.b_2 = tf.Variable(tf.truncated_normal([n_hidden_2], stddev=0.1), trainable=trainable)
             self.b_3 = tf.Variable(tf.truncated_normal([n_hidden_3], stddev=0.1), trainable=trainable)
+            self.b_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_RB = tf.Variable(tf.truncated_normal([self.n_RB], stddev=0.1), trainable=trainable)
+            # 新增：rho的bias（Normal分布，与power相同）
+            self.b_rho_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_rho_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_v = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
 
             layer_p1 = tf.nn.relu(tf.add(tf.matmul(self.s_input, self.w_1), self.b_1), name='p_1')
             layer_1_b = tf.layers.batch_normalization(layer_p1)
@@ -234,37 +287,23 @@ class PPO(object):
 
             critic_input = layer_3_b  # For critic
             
-            # Actor heads (shared for both GAT and MLP)
-            self.w_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            self.w_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            self.w_RB = tf.Variable(initializer(shape=(n_hidden_2, self.n_RB)), trainable=trainable)
-            # 新增：rho的网络参数（Beta分布）
-            self.w_rho_alpha = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            self.w_rho_beta = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            
-            self.b_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            self.b_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            self.b_RB = tf.Variable(tf.truncated_normal([self.n_RB], stddev=0.1), trainable=trainable)
-            # 新增：rho的bias
-            self.b_rho_alpha = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            self.b_rho_beta = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            
+            # Actor heads
             mu = tf.nn.tanh(tf.add(tf.matmul(layer_2_b, self.w_mu), self.b_mu), name='mu_layer')
             sigma = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_sigma), self.b_sigma), name='sigma_layer')
             RB_probs = tf.nn.softmax(tf.add(tf.matmul(layer_2_b, self.w_RB), self.b_RB), name='RB_layer')
             RB_distribution = tf.distributions.Categorical(probs=RB_probs)
             
-            # 新增：rho的Beta分布（压缩比 rho ∈ [0,1]）
-            rho_alpha = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_alpha), self.b_rho_alpha)) + 1.0
-            rho_beta = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_beta), self.b_rho_beta)) + 1.0
-            rho_distribution = tf.distributions.Beta(rho_alpha, rho_beta)
+            # 新增：rho的Normal分布（与power相同的方式，压缩比 rho ∈ [0,1]）
+            # 使用sigmoid将mu映射到[0,1]范围
+            rho_mu = tf.nn.sigmoid(tf.add(tf.matmul(layer_2_b, self.w_rho_mu), self.b_rho_mu), name='rho_mu_layer')
+            rho_sigma = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_sigma), self.b_rho_sigma), name='rho_sigma_layer')
+            rho_mu, rho_sigma = rho_mu, rho_sigma + sigma_add
+            rho_distribution = tf.distributions.Normal(loc=rho_mu, scale=rho_sigma)
             
             mu, sigma = mu, sigma + sigma_add
             norm_dist = tf.distributions.Normal(loc=mu, scale=sigma)
             
             # Critic network (MLP)
-            self.w_v = tf.Variable(initializer(shape=(n_hidden_3, 1)), trainable=trainable)
-            self.b_v = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
             v = tf.nn.relu(tf.add(tf.matmul(critic_input, self.w_v), self.b_v), name='v_layer')
             
             saver = tf.train.Saver(max_to_keep=self.n_veh * 2)
@@ -395,8 +434,8 @@ class PPO(object):
         w_sigma_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
         w_RB_mean = np.random.normal(0, sigma, [n_hidden_2, self.n_RB])
         # 新增：rho参数平均
-        w_rho_alpha_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_rho_beta_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
+        w_rho_mu_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
+        w_rho_sigma_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
         w_v_mean = np.random.normal(0, sigma, [n_hidden_3, 1])
 
         b_1_mean = np.random.normal(0, sigma, [n_hidden_1])
@@ -406,8 +445,8 @@ class PPO(object):
         b_sigma_mean = np.random.normal(0, sigma, [1])
         b_RB_mean = np.random.normal(0, sigma, [self.n_RB])
         # 新增：rho bias平均
-        b_rho_alpha_mean = np.random.normal(0, sigma, [1])
-        b_rho_beta_mean = np.random.normal(0, sigma, [1])
+        b_rho_mu_mean = np.random.normal(0, sigma, [1])
+        b_rho_sigma_mean = np.random.normal(0, sigma, [1])
         b_v_mean = np.random.normal(0, sigma, [1])
 
         for i in range(self.n_veh):
@@ -418,8 +457,8 @@ class PPO(object):
             w_sigma_mean += self.sesses[i].run(self.w_sigma) / self.n_veh
             w_RB_mean += self.sesses[i].run(self.w_RB) / self.n_veh
             # 新增：rho参数聚合
-            w_rho_alpha_mean += self.sesses[i].run(self.w_rho_alpha) / self.n_veh
-            w_rho_beta_mean += self.sesses[i].run(self.w_rho_beta) / self.n_veh
+            w_rho_mu_mean += self.sesses[i].run(self.w_rho_mu) / self.n_veh
+            w_rho_sigma_mean += self.sesses[i].run(self.w_rho_sigma) / self.n_veh
             w_v_mean += self.sesses[i].run(self.w_v) / self.n_veh
 
             b_1_mean += self.sesses[i].run(self.b_1) / self.n_veh
@@ -429,8 +468,8 @@ class PPO(object):
             b_sigma_mean += self.sesses[i].run(self.b_sigma) / self.n_veh
             b_RB_mean += self.sesses[i].run(self.b_RB) / self.n_veh
             # 新增：rho bias聚合
-            b_rho_alpha_mean += self.sesses[i].run(self.b_rho_alpha) / self.n_veh
-            b_rho_beta_mean += self.sesses[i].run(self.b_rho_beta) / self.n_veh
+            b_rho_mu_mean += self.sesses[i].run(self.b_rho_mu) / self.n_veh
+            b_rho_sigma_mean += self.sesses[i].run(self.b_rho_sigma) / self.n_veh
             b_v_mean += self.sesses[i].run(self.b_v) / self.n_veh
 
         for i in range(self.n_veh):
@@ -441,8 +480,8 @@ class PPO(object):
             self.sesses[i].run(self.w_sigma.assign(w_sigma_mean))
             self.sesses[i].run(self.w_RB.assign(w_RB_mean))
             # 新增：rho参数分发
-            self.sesses[i].run(self.w_rho_alpha.assign(w_rho_alpha_mean))
-            self.sesses[i].run(self.w_rho_beta.assign(w_rho_beta_mean))
+            self.sesses[i].run(self.w_rho_mu.assign(w_rho_mu_mean))
+            self.sesses[i].run(self.w_rho_sigma.assign(w_rho_sigma_mean))
             self.sesses[i].run(self.w_v.assign(w_v_mean))
 
             self.sesses[i].run(self.b_1.assign(b_1_mean))
@@ -452,8 +491,8 @@ class PPO(object):
             self.sesses[i].run(self.b_sigma.assign(b_sigma_mean))
             self.sesses[i].run(self.b_RB.assign(b_RB_mean))
             # 新增：rho bias分发
-            self.sesses[i].run(self.b_rho_alpha.assign(b_rho_alpha_mean))
-            self.sesses[i].run(self.b_rho_beta.assign(b_rho_beta_mean))
+            self.sesses[i].run(self.b_rho_mu.assign(b_rho_mu_mean))
+            self.sesses[i].run(self.b_rho_sigma.assign(b_rho_sigma_mean))
             self.sesses[i].run(self.b_v.assign(b_v_mean))
         return
 
@@ -511,8 +550,8 @@ class PPO(object):
         w_sigma_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
         w_RB_mean = np.random.normal(0, sigma, [n_hidden_2, self.n_RB])
         # 新增：rho参数平均
-        w_rho_alpha_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_rho_beta_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
+        w_rho_mu_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
+        w_rho_sigma_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
         w_v_mean = np.random.normal(0, sigma, [n_hidden_3, 1])
 
         b_1_mean = np.random.normal(0, sigma, [n_hidden_1])
@@ -522,8 +561,8 @@ class PPO(object):
         b_sigma_mean = np.random.normal(0, sigma, [1])
         b_RB_mean = np.random.normal(0, sigma, [self.n_RB])
         # 新增：rho bias平均
-        b_rho_alpha_mean = np.random.normal(0, sigma, [1])
-        b_rho_beta_mean = np.random.normal(0, sigma, [1])
+        b_rho_mu_mean = np.random.normal(0, sigma, [1])
+        b_rho_sigma_mean = np.random.normal(0, sigma, [1])
         b_v_mean = np.random.normal(0, sigma, [1])
 
         for i in range(self.n_veh):
@@ -534,8 +573,8 @@ class PPO(object):
             w_sigma_mean += self.sesses[i].run(self.w_sigma) / self.n_veh
             w_RB_mean += self.sesses[i].run(self.w_RB) / self.n_veh
             # 新增：rho参数聚合
-            w_rho_alpha_mean += self.sesses[i].run(self.w_rho_alpha) / self.n_veh
-            w_rho_beta_mean += self.sesses[i].run(self.w_rho_beta) / self.n_veh
+            w_rho_mu_mean += self.sesses[i].run(self.w_rho_mu) / self.n_veh
+            w_rho_sigma_mean += self.sesses[i].run(self.w_rho_sigma) / self.n_veh
             w_v_mean += self.sesses[i].run(self.w_v) / self.n_veh
 
             b_1_mean += self.sesses[i].run(self.b_1) / self.n_veh
@@ -545,8 +584,8 @@ class PPO(object):
             b_sigma_mean += self.sesses[i].run(self.b_sigma) / self.n_veh
             b_RB_mean += self.sesses[i].run(self.b_RB) / self.n_veh
             # 新增：rho bias聚合
-            b_rho_alpha_mean += self.sesses[i].run(self.b_rho_alpha) / self.n_veh
-            b_rho_beta_mean += self.sesses[i].run(self.b_rho_beta) / self.n_veh
+            b_rho_mu_mean += self.sesses[i].run(self.b_rho_mu) / self.n_veh
+            b_rho_sigma_mean += self.sesses[i].run(self.b_rho_sigma) / self.n_veh
             b_v_mean += self.sesses[i].run(self.b_v) / self.n_veh
 
         for i in range(self.n_veh):
@@ -557,8 +596,8 @@ class PPO(object):
             self.sesses[i].run(self.w_sigma.assign(w_sigma_mean))
             self.sesses[i].run(self.w_RB.assign(w_RB_mean))
             # 新增：rho参数分发
-            self.sesses[i].run(self.w_rho_alpha.assign(w_rho_alpha_mean))
-            self.sesses[i].run(self.w_rho_beta.assign(w_rho_beta_mean))
+            self.sesses[i].run(self.w_rho_mu.assign(w_rho_mu_mean))
+            self.sesses[i].run(self.w_rho_sigma.assign(w_rho_sigma_mean))
             self.sesses[i].run(self.w_v.assign(w_v_mean))
 
             self.sesses[i].run(self.b_1.assign(b_1_mean))
@@ -568,6 +607,6 @@ class PPO(object):
             self.sesses[i].run(self.b_sigma.assign(b_sigma_mean))
             self.sesses[i].run(self.b_RB.assign(b_RB_mean))
             # 新增：rho bias分发
-            self.sesses[i].run(self.b_rho_alpha.assign(b_rho_alpha_mean))
-            self.sesses[i].run(self.b_rho_beta.assign(b_rho_beta_mean))
+            self.sesses[i].run(self.b_rho_mu.assign(b_rho_mu_mean))
+            self.sesses[i].run(self.b_rho_sigma.assign(b_rho_sigma_mean))
             self.sesses[i].run(self.b_v.assign(b_v_mean))

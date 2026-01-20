@@ -60,8 +60,9 @@ class PPO(object):
         ratio = pi.prob(power_action) / (old_pi.prob(power_action) + 1e-8)
         ratio = tf.clip_by_value(ratio, 1e-6, 1e6)
         
-        # Rho probability ratio
-        ratio_rho = rho_distribution.prob(rho_action) / (old_rho_distribution.prob(rho_action) + 1e-8)
+        # Rho probability ratio（使用Normal分布，需要clip到[0,1]范围）
+        rho_action_clipped = tf.clip_by_value(rho_action, 0.0, 1.0)
+        ratio_rho = rho_distribution.prob(rho_action_clipped) / (old_rho_distribution.prob(rho_action_clipped) + 1e-8)
         ratio_rho = tf.clip_by_value(ratio_rho, 1e-6, 1e6)
 
         L_vf = tf.reduce_mean(tf.square(self.reward + self.gamma * self.v_pred_next - self.v))
@@ -93,11 +94,14 @@ class PPO(object):
         L = L_clip + L_RB + L_rho - c1 * L_vf + c2 * S
         self.Loss = [L_clip, L_RB, L_rho, L_vf, S]
         self.Loss_value = -L
-        # 动作采样：RB (Categorical) + Power (Normal) + Rho (Beta)
+        # 动作采样：RB (Categorical) + Power (Normal) + Rho (Normal，与power相同)
+        # 对于rho，采样后需要clip到[0,1]范围（因为使用Normal分布）
+        rho_sample = tf.squeeze(rho_distribution.sample(1), axis=0)
+        rho_sample = tf.clip_by_value(rho_sample, 0.0, 1.0)  # 确保rho在[0,1]范围内
         self.choose_action_op = tf.concat([
             tf.transpose(tf.cast(RB_distribution.sample(1), dtype=tf.float32)), 
             tf.squeeze(pi.sample(1), axis=0),
-            tf.squeeze(rho_distribution.sample(1), axis=0)  # 新增：压缩比
+            rho_sample  # 新增：压缩比
         ], 1)
         self.train_op = tf.train.AdamOptimizer(lr_a).minimize(-L)
         self.update_params_op = [tf.assign(r, v) for r, v in zip(old_params, params)]
@@ -114,9 +118,9 @@ class PPO(object):
             self.w_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
             self.w_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
             self.w_RB = tf.Variable(initializer(shape=(n_hidden_2, self.n_RB)), trainable=trainable)
-            # 新增：rho的网络参数（Beta分布）
-            self.w_rho_alpha = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            self.w_rho_beta = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            # 新增：rho的网络参数（Normal分布，与power相同）
+            self.w_rho_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_rho_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
             self.w_v = tf.Variable(initializer(shape=(n_hidden_3, 1)), trainable=trainable)
 
             self.b_1 = tf.Variable(tf.truncated_normal([n_hidden_1], stddev=0.1), trainable=trainable)
@@ -125,9 +129,9 @@ class PPO(object):
             self.b_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
             self.b_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
             self.b_RB = tf.Variable(tf.truncated_normal([self.n_RB], stddev=0.1), trainable=trainable)
-            # 新增：rho的bias
-            self.b_rho_alpha = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            self.b_rho_beta = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            # 新增：rho的bias（Normal分布，与power相同）
+            self.b_rho_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_rho_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
             self.b_v = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
 
             layer_p1 = tf.nn.relu(tf.add(tf.matmul(self.s_input, self.w_1), self.b_1), name='p_1')
@@ -142,10 +146,12 @@ class PPO(object):
             RB_probs = tf.nn.softmax(tf.add(tf.matmul(layer_2_b, self.w_RB), self.b_RB), name='RB_layer')
             RB_distribution = tf.distributions.Categorical(probs=RB_probs)
             
-            # 新增：rho的Beta分布（压缩比 rho ∈ [0,1]）
-            rho_alpha = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_alpha), self.b_rho_alpha)) + 1.0
-            rho_beta = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_beta), self.b_rho_beta)) + 1.0
-            rho_distribution = tf.distributions.Beta(rho_alpha, rho_beta)
+            # 新增：rho的Normal分布（与power相同的方式，压缩比 rho ∈ [0,1]）
+            # 使用sigmoid将mu映射到[0,1]范围
+            rho_mu = tf.nn.sigmoid(tf.add(tf.matmul(layer_2_b, self.w_rho_mu), self.b_rho_mu), name='rho_mu_layer')
+            rho_sigma = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_sigma), self.b_rho_sigma), name='rho_sigma_layer')
+            rho_mu, rho_sigma = rho_mu, rho_sigma + sigma_add
+            rho_distribution = tf.distributions.Normal(loc=rho_mu, scale=rho_sigma)
 
             saver = tf.train.Saver()
 
@@ -228,53 +234,12 @@ class PPO(object):
         return gaes
 
     def averaging_model(self, n_veh):
-        # success_rate = success_rate.reshape(self.n_veh)
-        mu = 0
-        sigma = 1e-8
-        w_1_mean = np.random.normal(0, sigma, [self.s_dim, n_hidden_1])
-        w_2_mean = np.random.normal(0, sigma, [n_hidden_1, n_hidden_2])
-        w_3_mean = np.random.normal(0, sigma, [n_hidden_2, n_hidden_3])
-        w_mu_mean = np.random.normal(0, sigma, [n_hidden_3, self.a_dim])
-        w_sigma_mean = np.random.normal(0, sigma, [n_hidden_3, self.a_dim])
-        w_v_mean = np.random.normal(0, sigma, [n_hidden_3, 1])
-
-        b_1_mean = np.random.normal(0, sigma, [n_hidden_1])
-        b_2_mean = np.random.normal(0, sigma, [n_hidden_2])
-        b_3_mean = np.random.normal(0, sigma, [n_hidden_3])
-        b_mu_mean = np.random.normal(0, sigma, [self.a_dim])
-        b_sigma_mean = np.random.normal(0, sigma, [self.a_dim])
-        b_v_mean = np.random.normal(0, sigma, [1])
-
-        for i in range(n_veh):
-                # if IS_Fed_success:
-                #     w_1_mean += sesses[i].run(w_1) * success_rate[i] / sum(success_rate)
-                #     w_2_mean += sesses[i].run(w_2) * success_rate[i] / sum(success_rate)
-                #     w_3_mean += sesses[i].run(w_3) * success_rate[i] / sum(success_rate)
-                #     w_4_mean += sesses[i].run(w_4) * success_rate[i] / sum(success_rate)
-                #
-                #     b_1_mean += sesses[i].run(b_1) * success_rate[i] / sum(success_rate)
-                #     b_2_mean += sesses[i].run(b_2) * success_rate[i] / sum(success_rate)
-                #     b_3_mean += sesses[i].run(b_3) * success_rate[i] / sum(success_rate)
-                #     b_4_mean += sesses[i].run(b_4) * success_rate[i] / sum(success_rate)
-                # else:
-            w_1_mean += self.sesses[i].run(self.w_1) / n_veh
-            w_2_mean += self.sesses [i].run(self.w_2) / n_veh
-            w_3_mean += self.sesses [i].run(self.w_3) / n_veh
-            w_mu_mean += self.sesses [i].run(self.w_mu) / n_veh
-            w_sigma_mean += self.sesses [i].run(self.w_sigma) / n_veh
-            w_v_mean += self.sesses [i].run(self.w_v) / n_veh
-
-
-            b_1_mean += self.sesses [i].run(self.b_1) / n_veh
-            b_2_mean += self.sesses [i].run(self.b_2) / n_veh
-            b_3_mean += self.sesses [i].run(self.b_3) / n_veh
-            b_mu_mean += self.sesses [i].run(self.b_mu) / n_veh
-            b_sigma_mean += self.sesses [i].run(self.b_sigma) / n_veh
-            b_v_mean += self.sesses [i].run(self.b_v) / n_veh
-
-        # NOTE: This method should NOT be called in meta training.
-        # Meta training uses a single agent (self.sess), not multiple agents (self.sesses).
-        # This method is kept for compatibility but will raise an error if called.
+        """
+        NOTE: This method should NOT be called in meta training.
+        Meta training uses a single agent (self.sess), not multiple agents (self.sesses).
+        This method is kept for interface compatibility but will raise an error if called.
+        Federated learning averaging is handled in PPO_brain_AC.py, not here.
+        """
         raise NotImplementedError(
             "averaging_model should not be called in meta training. "
             "Meta training uses a single agent (self.sess), not multiple agents (self.sesses). "
