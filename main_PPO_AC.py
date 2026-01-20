@@ -80,12 +80,50 @@ def get_state(env, idx=(0, 0), n_veh=0, ind_episode=0.):
     cellular_fast = (env.cellular_channels_with_fastfading[idx[0], :] - env.cellular_channels_abs[idx[0]] + 10) / 35
     cellular_abs = (env.cellular_channels_abs[idx[0]] - 80) / 60.0
     success = env.success[idx[0]]
-    channel_choice = env.channel_choice / n_veh
+    channel_choice = env.channel_choice / max(n_veh, 1)  # Avoid division by zero
     vehicle_vector = np.zeros(n_RB)
     for i in range(n_veh):
         vehicle_vector[i] = 1 / n_veh
-    return np.concatenate((np.reshape(cellular_fast, -1), np.reshape(cellular_abs, -1), np.reshape(channel_choice, -1), vehicle_vector,
-                           np.asarray([success, ind_episode / (n_episode)])))
+    
+    # Semantic communication metrics (normalized)
+    semantic_accuracy = getattr(env, 'semantic_accuracy', np.zeros(env.n_Veh))[idx[0]]
+    semantic_EE = getattr(env, 'semantic_EE', np.zeros(env.n_Veh))[idx[0]]
+    semantic_similarity = getattr(env, 'semantic_similarity', np.zeros(env.n_Veh))[idx[0]]
+    rho_current = getattr(env, 'rho_current', np.zeros(env.n_Veh))[idx[0]]
+    sinr_dB = 10 * np.log10(getattr(env, 'cellular_SINR', np.zeros(env.n_Veh))[idx[0]] + 1e-10)  # Convert to dB, avoid log(0)
+    sinr_normalized = (sinr_dB + 20) / 40.0  # Normalize: assume range [-20, 20] dB -> [0, 1]
+    sinr_normalized = np.clip(sinr_normalized, 0.0, 1.0)
+    
+    # Normalize semantic metrics to [0, 1] range
+    # semantic_accuracy is already in [A2, A1] = [0.2, 1.0], normalize to [0, 1]
+    semantic_accuracy_norm = (semantic_accuracy - 0.2) / 0.8 if 0.8 > 0 else semantic_accuracy
+    semantic_accuracy_norm = np.clip(semantic_accuracy_norm, 0.0, 1.0)
+    
+    # semantic_EE can vary widely, use log normalization
+    semantic_EE_norm = np.log1p(semantic_EE) / np.log1p(10.0)  # Normalize assuming max ~10
+    semantic_EE_norm = np.clip(semantic_EE_norm, 0.0, 1.0)
+    
+    # semantic_similarity is already in [A2, A1] = [0.2, 1.0], normalize to [0, 1]
+    semantic_similarity_norm = (semantic_similarity - 0.2) / 0.8 if 0.8 > 0 else semantic_similarity
+    semantic_similarity_norm = np.clip(semantic_similarity_norm, 0.0, 1.0)
+    
+    # rho_current is already in [0, 1], no normalization needed
+    
+    return np.concatenate((
+        np.reshape(cellular_fast, -1),      # n_RB维
+        np.reshape(cellular_abs, -1),       # n_RB维
+        np.reshape(channel_choice, -1),      # n_RB维
+        vehicle_vector,                      # n_RB维
+        np.asarray([
+            success,                         # 1维
+            ind_episode / (n_episode),       # 1维
+            semantic_accuracy_norm,          # 1维 - 新增：语义准确度
+            semantic_EE_norm,                # 1维 - 新增：语义能量效率
+            semantic_similarity_norm,        # 1维 - 新增：语义相似度
+            rho_current,                     # 1维 - 新增：当前压缩比
+            sinr_normalized                  # 1维 - 新增：SINR (归一化)
+        ])
+    ))
 
 
 def save_models(sess, model_path, saver):

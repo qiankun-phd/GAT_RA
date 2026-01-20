@@ -47,9 +47,9 @@ def get_args():
         help='number of vehicles (default: 6)')
     parser.add_argument(
         '--n_veh_list',
-        type=list,
+        type=lambda s: [int(item) for item in s.strip('[]').split(',')],
         default=[2, 4, 8],
-        help='number of vehicles (for different tasks)')
+        help='number of vehicles (for different tasks), e.g., [2,4,6,8,10] or 2,4,6,8,10')
     parser.add_argument(
         '--n_RB',
         type=int,

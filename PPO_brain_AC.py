@@ -163,16 +163,17 @@ class PPO(object):
             self.sesses.append(sess)
         if self.IS_meta:
             print("\nRestoring the model...")
-            # 固定使用SE_EE优化目标
-            optimization_target = 'SE_EE'
-            beta = args.beta if hasattr(args, 'beta') else 0.5
+            # 使用SEE优化目标（与meta_train_PPO_AC.py保持一致）
+            optimization_target = 'SEE'
             
-            opt_target_str = optimization_target.replace('_', '&')
-            opt_suffix = f'{opt_target_str}_{beta:.2f}'
+            # Meta训练保存格式: AC_SEE_{sigma_add}_{meta_episode}_{lr_meta_a}
+            # 不再使用beta参数（已废弃）
+            opt_suffix = optimization_target  # 直接使用'SEE'
             
             for i in range(self.n_veh):
                 meta_save_path = 'meta_model_'
                 model_path = meta_save_path + 'AC_' + opt_suffix + '_' + '%s_' %sigma_add + '%d_' % meta_episode +'%s_' %args.lr_meta_a
+                print(f"Loading meta model for agent {i}: {model_path}")
                 self.load_models(self.sesses[i], model_path, self.saver)
 
     def load_models(self, sess, model_path, saver):
@@ -180,7 +181,17 @@ class PPO(object):
         dir_ = os.path.dirname(os.path.realpath(__file__))
         model_path = os.path.join(dir_, "model/" + model_path)
         if os.path.exists(model_path + '.index'):
-            saver.restore(sess, model_path)
+            try:
+                saver.restore(sess, model_path)
+                print(f"✅ Successfully loaded model: {model_path}")
+            except Exception as e:
+                print(f"❌ Failed to load model: {model_path}")
+                print(f"   Error: {e}")
+                print(f"   This may be due to shape mismatch between saved model and current network structure.")
+                print(f"   The saved model may have been trained with a different network structure.")
+                print(f"   Suggestion: Re-train the meta model with the current code version.")
+                # 不抛出异常，让训练继续（使用随机初始化的权重）
+                print(f"   Continuing with randomly initialized weights...")
         else:
             print(f"Warning: Model path {model_path} does not exist, skipping load.")
 

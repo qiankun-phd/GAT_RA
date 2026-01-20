@@ -251,6 +251,14 @@ class Environ:
         self.similarity_success = np.zeros([self.n_Veh])  # Track similarity threshold achievement
         self.sig2 = [i * 1e6 * 10 ** (self.sig2_dB / 10) for i in self.BW]
         
+        # Initialize semantic communication metrics for state representation
+        self.semantic_accuracy = np.zeros(self.n_Veh)
+        self.semantic_EE = np.zeros(self.n_Veh)
+        self.semantic_Rate = np.zeros(self.n_Veh)
+        self.semantic_similarity = np.zeros(self.n_Veh)  # epsilon (semantic similarity)
+        self.rho_current = np.zeros(self.n_Veh)  # Current compression ratio
+        self.cellular_SINR = np.zeros(self.n_Veh)  # Store SINR for state
+        
         # Optimization target: only Semantic-EE (SEE)
         self.optimization_target = 'SEE'  # Fixed to SEE (only optimize Semantic-EE)
         self.beta = beta  # Deprecated, kept for backward compatibility (not used in reward calculation)
@@ -706,6 +714,17 @@ class Environ:
         # No additional penalties - failures handled by success flag and SINR threshold
         semantic_EE_penalized = semantic_EE
         
+        # Store semantic metrics for state representation (after all calculations are complete)
+        for i in range(len(self.vehicles)):
+            self.semantic_accuracy[i] = semantic_accuracy[i]
+            self.semantic_EE[i] = semantic_EE[i]
+            self.semantic_Rate[i] = semantic_Rate[i]
+            # Compute semantic similarity for storage
+            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
+            self.semantic_similarity[i] = epsilon
+            self.rho_current[i] = rho[i]
+            self.cellular_SINR[i] = cellular_SINR[i]
+        
         # Keep old metrics for backward compatibility
         cellular_Rate = np.zeros(self.n_Veh)
         SE = np.zeros(self.n_Veh)
@@ -846,6 +865,9 @@ class Environ:
         SE_sum = 0.0  # Not used in reward calculation (kept for potential future use)
         Semantic_EE_sum = 0.0
         
+        # Initialize reward to avoid UnboundLocalError
+        reward = 0.0
+        
         # Training semantic similarity threshold (instead of SINR threshold)
         # 使用语义相似度门限，更符合语义通信的特点
         training_similarity_threshold = 0.5  # 语义相似度门限 [A2, A1] = [0.2, 1.0]
@@ -866,12 +888,14 @@ class Environ:
             else:
                 # Case 3: Failure (collision) - apply penalty
                 Semantic_EE_sum = (np.sum(self.success) - self.n_Veh) / self.n_Veh
+                reward = Semantic_EE_sum  # Set reward before break
                 break
+            
+            reward = Semantic_EE_sum
         
         # Return sum (not average) for meta training
         # 注意：meta训练返回sum，而普通训练返回average
         # 如果需要缩放，可以在这里添加（但通常meta训练不需要，因为返回的是sum）
-        reward = Semantic_EE_sum
         return reward
 
     def act_for_training(self, actions, IS_PPO):
@@ -913,6 +937,9 @@ class Environ:
         # Initialize similarity_success for this step
         self.similarity_success = np.zeros([self.n_Veh])
         
+        # Initialize reward to avoid UnboundLocalError
+        reward = 0.0
+        
         # Simplified logic: two cases (Case 2 and Case 3 merged since they use same handling)
         for i in range(len(self.success)):
             # 计算语义相似度
@@ -933,9 +960,10 @@ class Environ:
             else:
                 # Case 3: Failure (collision) - apply penalty
                 Semantic_EE_sum = (np.sum(self.success) - self.n_Veh) / self.n_Veh
+                reward = Semantic_EE_sum / self.n_Veh  # Set reward before break
                 break
 
-        reward = Semantic_EE_sum / self.n_Veh
+            reward = Semantic_EE_sum / self.n_Veh
         
         return reward
 

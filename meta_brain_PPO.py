@@ -272,17 +272,11 @@ class PPO(object):
             b_sigma_mean += self.sesses [i].run(self.b_sigma) / n_veh
             b_v_mean += self.sesses [i].run(self.b_v) / n_veh
 
-        for i in range(n_veh):
-            self.sesses [i].run(self.w_1.assign(w_1_mean))
-            self.sesses [i].run(self.w_2.assign(w_2_mean))
-            self.sesses [i].run(self.w_3.assign(w_3_mean))
-            self.sesses [i].run(self.w_mu.assign(w_mu_mean))
-            self.sesses [i].run(self.w_sigma.assign(w_sigma_mean))
-            self.sesses [i].run(self.w_v.assign(w_v_mean))
-
-            self.sesses [i].run(self.b_1.assign(b_1_mean))
-            self.sesses [i].run(self.b_2.assign(b_2_mean))
-            self.sesses [i].run(self.b_3.assign(b_3_mean))
-            self.sesses [i].run(self.b_mu.assign(b_mu_mean))
-            self.sesses [i].run(self.b_sigma.assign(b_sigma_mean))
-            self.sesses [i].run(self.b_v.assign(b_v_mean))
+        # NOTE: This method should NOT be called in meta training.
+        # Meta training uses a single agent (self.sess), not multiple agents (self.sesses).
+        # This method is kept for compatibility but will raise an error if called.
+        raise NotImplementedError(
+            "averaging_model should not be called in meta training. "
+            "Meta training uses a single agent (self.sess), not multiple agents (self.sesses). "
+            "This method is only for federated learning in main_PPO_AC.py."
+        )
