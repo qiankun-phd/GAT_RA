@@ -1,2 +1,2 @@
-model_checkpoint_path: "/home/qiankun/Semcom_ra/GAT_RA/model/meta_model_AC_SEE_0.3_100_5e-07_"
-all_model_checkpoint_paths: "/home/qiankun/Semcom_ra/GAT_RA/model/meta_model_AC_SEE_0.3_100_5e-07_"
+model_checkpoint_path: "/home/qiankun/uav_ra/GAT_RA/model/meta_model_AC_SEE_0.3_100_5e-07_"
+all_model_checkpoint_paths: "/home/qiankun/uav_ra/GAT_RA/model/meta_model_AC_SEE_0.3_100_5e-07_"

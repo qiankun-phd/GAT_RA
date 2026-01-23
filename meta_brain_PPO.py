@@ -42,8 +42,8 @@ class PPO(object):
         #     self.ctrain_op = tf.train.AdamOptimizer(C_LR).minimize(self.closs)
 
 
-        pi, RB_distribution, rho_distribution, self.v, params, self.saver = self._build_net('network', True)
-        old_pi, old_RB_distribution, old_rho_distribution, old_v, old_params, _ = self._build_net('old_network', False)
+        power_dist, RB_distribution, rho_distribution, self.v, params, self.saver = self._build_net('network', True)
+        old_power_dist, old_RB_distribution, old_rho_distribution, old_v, old_params, _ = self._build_net('old_network', False)
         self.reward = tf.placeholder(tf.float32, shape=[None], name='reward')
         self.v_pred_next = tf.placeholder(dtype=tf.float32, shape=[None], name='v_pred_next')
         self.gae = tf.placeholder(dtype=tf.float32, shape=[None], name='gae')
@@ -56,12 +56,15 @@ class PPO(object):
         power_action = self.a[:,1]
         rho_action = self.a[:,2]  # Compression ratio
         
-        # Power probability ratio
-        ratio = pi.prob(power_action) / (old_pi.prob(power_action) + 1e-8)
+        # Beta分布处理：power和rho都使用Beta分布，输出[0,1]
+        # Power需要从[-bound, bound]映射到[0,1]来计算概率
+        power_normalized = (power_action + self.a_bound[1]) / (2 * self.a_bound[1] + 1e-8)
+        power_normalized = tf.clip_by_value(power_normalized, 1e-6, 1.0 - 1e-6)  # 避免边界值
+        ratio = power_dist.prob(power_normalized) / (old_power_dist.prob(power_normalized) + 1e-8)
         ratio = tf.clip_by_value(ratio, 1e-6, 1e6)
         
-        # Rho probability ratio（使用Normal分布，需要clip到[0,1]范围）
-        rho_action_clipped = tf.clip_by_value(rho_action, 0.0, 1.0)
+        # Rho已经是[0,1]范围，直接使用Beta分布
+        rho_action_clipped = tf.clip_by_value(rho_action, 1e-6, 1.0 - 1e-6)  # 避免边界值
         ratio_rho = rho_distribution.prob(rho_action_clipped) / (old_rho_distribution.prob(rho_action_clipped) + 1e-8)
         ratio_rho = tf.clip_by_value(ratio_rho, 1e-6, 1e6)
 
@@ -88,20 +91,24 @@ class PPO(object):
         ))
 
         # Entropy (for exploration)
-        S = tf.reduce_mean(pi.entropy() + RB_distribution.entropy() + rho_distribution.entropy())
+        S = tf.reduce_mean(power_dist.entropy() + RB_distribution.entropy() + rho_distribution.entropy())
 
         # Total loss
         L = L_clip + L_RB + L_rho - c1 * L_vf + c2 * S
         self.Loss = [L_clip, L_RB, L_rho, L_vf, S]
         self.Loss_value = -L
-        # 动作采样：RB (Categorical) + Power (Normal) + Rho (Normal，与power相同)
-        # 对于rho，采样后需要clip到[0,1]范围（因为使用Normal分布）
-        rho_sample = tf.squeeze(rho_distribution.sample(1), axis=0)
-        rho_sample = tf.clip_by_value(rho_sample, 0.0, 1.0)  # 确保rho在[0,1]范围内
+        # 动作采样：RB (Categorical) + Power (Beta) + Rho (Beta)
+        # Beta分布输出[0,1]，power需要映射到[-bound, bound]
+        power_sample_beta = tf.squeeze(power_dist.sample(1), axis=0)  # [0,1]
+        # 映射到[-bound, bound]：power_scaled = power_sample * 2 * bound - bound
+        power_sample_scaled = power_sample_beta * 2 * self.a_bound[1] - self.a_bound[1]
+        
+        rho_sample = tf.squeeze(rho_distribution.sample(1), axis=0)  # [0,1]，Beta分布天然有界
+        
         self.choose_action_op = tf.concat([
             tf.transpose(tf.cast(RB_distribution.sample(1), dtype=tf.float32)), 
-            tf.squeeze(pi.sample(1), axis=0),
-            rho_sample  # 新增：压缩比
+            power_sample_scaled,
+            rho_sample
         ], 1)
         self.train_op = tf.train.AdamOptimizer(lr_a).minimize(-L)
         self.update_params_op = [tf.assign(r, v) for r, v in zip(old_params, params)]
@@ -115,23 +122,25 @@ class PPO(object):
             self.w_1 = tf.Variable(initializer(shape=(self.s_dim, n_hidden_1)), trainable=trainable)
             self.w_2 = tf.Variable(initializer(shape=(n_hidden_1, n_hidden_2)), trainable=trainable)
             self.w_3 = tf.Variable(initializer(shape=(n_hidden_2, n_hidden_3)), trainable=trainable)
-            self.w_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            self.w_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            # Power Beta分布参数：alpha和beta
+            self.w_power_alpha = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_power_beta = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
             self.w_RB = tf.Variable(initializer(shape=(n_hidden_2, self.n_RB)), trainable=trainable)
-            # 新增：rho的网络参数（Normal分布，与power相同）
-            self.w_rho_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            self.w_rho_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            # Rho Beta分布参数：alpha和beta
+            self.w_rho_alpha = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_rho_beta = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
             self.w_v = tf.Variable(initializer(shape=(n_hidden_3, 1)), trainable=trainable)
 
             self.b_1 = tf.Variable(tf.truncated_normal([n_hidden_1], stddev=0.1), trainable=trainable)
             self.b_2 = tf.Variable(tf.truncated_normal([n_hidden_2], stddev=0.1), trainable=trainable)
             self.b_3 = tf.Variable(tf.truncated_normal([n_hidden_3], stddev=0.1), trainable=trainable)
-            self.b_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            self.b_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            # Power Beta分布bias
+            self.b_power_alpha = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_power_beta = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
             self.b_RB = tf.Variable(tf.truncated_normal([self.n_RB], stddev=0.1), trainable=trainable)
-            # 新增：rho的bias（Normal分布，与power相同）
-            self.b_rho_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            self.b_rho_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            # Rho Beta分布bias
+            self.b_rho_alpha = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_rho_beta = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
             self.b_v = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
 
             layer_p1 = tf.nn.relu(tf.add(tf.matmul(self.s_input, self.w_1), self.b_1), name='p_1')
@@ -141,41 +150,29 @@ class PPO(object):
             layer_p3 = tf.nn.relu(tf.add(tf.matmul(layer_2_b, self.w_3), self.b_3), name='p_3')
             layer_3_b = tf.layers.batch_normalization(layer_p3)
 
-            mu = tf.nn.tanh(tf.add(tf.matmul(layer_2_b, self.w_mu), self.b_mu), name='mu_layer')
-            sigma = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_sigma), self.b_sigma), name='sigma_layer')
             RB_probs = tf.nn.softmax(tf.add(tf.matmul(layer_2_b, self.w_RB), self.b_RB), name='RB_layer')
             RB_distribution = tf.distributions.Categorical(probs=RB_probs)
             
-            # 新增：rho的Normal分布（与power相同的方式，压缩比 rho ∈ [0,1]）
-            # 使用sigmoid将mu映射到[0,1]范围
-            rho_mu = tf.nn.sigmoid(tf.add(tf.matmul(layer_2_b, self.w_rho_mu), self.b_rho_mu), name='rho_mu_layer')
-            rho_sigma = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_sigma), self.b_rho_sigma), name='rho_sigma_layer')
-            rho_mu, rho_sigma = rho_mu, rho_sigma + sigma_add
-            rho_distribution = tf.distributions.Normal(loc=rho_mu, scale=rho_sigma)
+            # Power Beta分布：alpha和beta参数（确保>1以避免极端值）
+            power_alpha_raw = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_power_alpha), self.b_power_alpha), name='power_alpha_layer')
+            power_beta_raw = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_power_beta), self.b_power_beta), name='power_beta_layer')
+            power_alpha = power_alpha_raw + 1.0  # 确保alpha > 1
+            power_beta = power_beta_raw + 1.0    # 确保beta > 1
+            power_distribution = tf.distributions.Beta(concentration1=power_alpha, concentration0=power_beta)
+            
+            # Rho Beta分布：alpha和beta参数（确保>1以避免极端值）
+            rho_alpha_raw = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_alpha), self.b_rho_alpha), name='rho_alpha_layer')
+            rho_beta_raw = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_beta), self.b_rho_beta), name='rho_beta_layer')
+            rho_alpha = rho_alpha_raw + 1.0  # 确保alpha > 1
+            rho_beta = rho_beta_raw + 1.0    # 确保beta > 1
+            rho_distribution = tf.distributions.Beta(concentration1=rho_alpha, concentration0=rho_beta)
 
             saver = tf.train.Saver()
 
-
-            # layer_p1 = tf.layers.dense(self.s_input, 100, tf.nn.relu, name='p_0', trainable=trainable)
-            # layer_p2 = tf.layers.dense(layer_p1, 100, tf.nn.relu, name='p_1', trainable=trainable)
-            # layer_p3 = tf.layers.dense(layer_p2, 100, tf.nn.relu, name='p_2', trainable=trainable)
-            # mu = tf.layers.dense(layer_p3, self.a_dim, tf.nn.tanh, name='mu_layer', trainable=trainable)
-            # sigma = tf.layers.dense(layer_p3, self.a_dim, tf.nn.softplus, name='sigma_layer', trainable=trainable)
-
-            # layer_r0 = tf.layers.dense(self.s_input, 500, activation=tf.nn.relu, name='r_0', trainable=trainable)
-            # layer_r1 = tf.layers.dense(layer_r0, 250, activation=tf.nn.relu, name='r_1', trainable=trainable)
-            # layer_r2 = tf.layers.dense(layer_r1, 120, activation=tf.nn.relu, name='r_2', trainable=trainable)
-            # RB = tf.layers.dense(layer_r2, self.n_RB, activation=tf.nn.softmax, name='RB_layer', trainable=trainable)
-
             # 状态价值函数 v 与策略 π 共享同一套神经网络参数
             v =  tf.nn.relu(tf.add(tf.matmul(layer_3_b, self.w_v), self.b_v), name='v_layer')
-
-            # mu, sigma = mu, sigma + sigma_add
-            mu, sigma = mu, sigma + sigma_add
-
-            norm_dist = tf.distributions.Normal(loc=mu, scale=sigma)
         params = tf.global_variables(scope)
-        return norm_dist, RB_distribution, rho_distribution, v, params, saver
+        return power_distribution, RB_distribution, rho_distribution, v, params, saver
 
     def get_v(self, s, sess):
         return sess.run(self.v, {
@@ -185,9 +182,11 @@ class PPO(object):
     def choose_action(self, s, sess):
         a = np.squeeze(sess.run(self.choose_action_op, {self.s_input: s[np.newaxis, :]}))
         clipped_a = np.zeros(self.a_dim)
-        clipped_a[0] = a[0]  # RB (already integer from Categorical)
-        clipped_a[1] = np.clip(a[1], -self.a_bound[1], self.a_bound[1])  # Power
-        clipped_a[2] = np.clip(a[2], 0.0, 1.0)  # Rho (compression ratio) ∈ [0,1]
+        clipped_a[0] = a[0]  # RB (Categorical)
+        # Power已经是Beta分布映射后的值，在[-bound, bound]范围内，但为了安全还是clip一下
+        clipped_a[1] = np.clip(a[1], -self.a_bound[1], self.a_bound[1])
+        # Rho是Beta分布输出，天然在[0,1]范围内，但为了安全还是clip一下
+        clipped_a[2] = np.clip(a[2], 0.0, 1.0)
         return clipped_a
 
     def train(self, s, a, gae, reward, v_pred_next, sess):

@@ -62,8 +62,8 @@ class PPO(object):
         # MLP-based input
         self.s_input = tf.placeholder(tf.float32, shape=(None, self.s_dim), name='s_t')
 
-        pi, RB_distribution, rho_distribution, self.v, params, self.saver = self._build_net('network', True)
-        old_pi, old_RB_distribution, old_rho_distribution, old_v, old_params, _ = self._build_net('old_network', False)
+        power_dist, RB_distribution, rho_distribution, self.v, params, self.saver = self._build_net('network', True)
+        old_power_dist, old_RB_distribution, old_rho_distribution, old_v, old_params, _ = self._build_net('old_network', False)
         self.reward = tf.placeholder(tf.float32, shape=[None], name='reward')
         self.v_pred_next = tf.placeholder(dtype=tf.float32, shape=[None], name='v_pred_next')
         self.gae = tf.placeholder(dtype=tf.float32, shape=[None], name='gae')
@@ -75,11 +75,16 @@ class PPO(object):
         power_action = self.a[:,1]
         rho_action = self.a[:,2]  # Compression ratio
         
-        # MLP mode: original simple logic
-        power_prob = pi.prob(power_action)
-        old_power_prob = old_pi.prob(power_action)
-        # rho使用Normal分布，需要clip到[0,1]范围后再计算概率
-        rho_action_clipped = tf.clip_by_value(rho_action, 0.0, 1.0)
+        # Beta分布处理：power和rho都使用Beta分布，输出[0,1]
+        # Power需要从[-bound, bound]映射到[0,1]来计算概率
+        # 映射公式：power_normalized = (power_action + action_bound[1]) / (2 * action_bound[1])
+        power_normalized = (power_action + self.a_bound[1]) / (2 * self.a_bound[1] + 1e-8)
+        power_normalized = tf.clip_by_value(power_normalized, 1e-6, 1.0 - 1e-6)  # 避免边界值
+        power_prob = power_dist.prob(power_normalized)
+        old_power_prob = old_power_dist.prob(power_normalized)
+        
+        # Rho已经是[0,1]范围，直接使用Beta分布
+        rho_action_clipped = tf.clip_by_value(rho_action, 1e-6, 1.0 - 1e-6)  # 避免边界值
         rho_prob = rho_distribution.prob(rho_action_clipped)
         old_rho_prob = old_rho_distribution.prob(rho_action_clipped)
         
@@ -138,7 +143,7 @@ class PPO(object):
         L_rho = tf.where(tf.is_finite(L_rho), L_rho, tf.zeros_like(L_rho))
         
         # Entropy for exploration
-        S = tf.reduce_mean(pi.entropy() + RB_distribution.entropy() + rho_distribution.entropy())
+        S = tf.reduce_mean(power_dist.entropy() + RB_distribution.entropy() + rho_distribution.entropy())
         
         # Total loss (original code style, but with rho added)
         L = L_clip_power + L_RB + L_rho - c1 * L_vf + c2 * S
@@ -149,12 +154,16 @@ class PPO(object):
         self.Entropy_value = S
         
         # Sample actions (MLP mode)
-        # 对于rho，采样后需要clip到[0,1]范围（因为使用Normal分布）
-        rho_sample = tf.squeeze(rho_distribution.sample(1), axis=0)
-        rho_sample = tf.clip_by_value(rho_sample, 0.0, 1.0)  # 确保rho在[0,1]范围内
+        # Beta分布输出[0,1]，power需要映射到[-bound, bound]
+        power_sample_beta = tf.squeeze(power_dist.sample(1), axis=0)  # [0,1]
+        # 映射到[-bound, bound]：power_scaled = power_sample * 2 * bound - bound
+        power_sample_scaled = power_sample_beta * 2 * self.a_bound[1] - self.a_bound[1]
+        
+        rho_sample = tf.squeeze(rho_distribution.sample(1), axis=0)  # [0,1]，Beta分布天然有界
+        
         self.choose_action_op = tf.concat([
             tf.transpose(tf.cast(RB_distribution.sample(1), dtype=tf.float32)),
-            tf.squeeze(pi.sample(1), axis=0),
+            power_sample_scaled,
             rho_sample
         ], 1)
 
@@ -259,23 +268,25 @@ class PPO(object):
             self.w_1 = tf.Variable(initializer(shape=(self.s_dim, n_hidden_1)), trainable=trainable)
             self.w_2 = tf.Variable(initializer(shape=(n_hidden_1, n_hidden_2)), trainable=trainable)
             self.w_3 = tf.Variable(initializer(shape=(n_hidden_2, n_hidden_3)), trainable=trainable)
-            self.w_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            self.w_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            # Power Beta分布参数：alpha和beta
+            self.w_power_alpha = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_power_beta = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
             self.w_RB = tf.Variable(initializer(shape=(n_hidden_2, self.n_RB)), trainable=trainable)
-            # 新增：rho的网络参数（Normal分布，与power相同）
-            self.w_rho_mu = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
-            self.w_rho_sigma = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            # Rho Beta分布参数：alpha和beta
+            self.w_rho_alpha = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
+            self.w_rho_beta = tf.Variable(initializer(shape=(n_hidden_2, 1)), trainable=trainable)
             self.w_v = tf.Variable(initializer(shape=(n_hidden_3, 1)), trainable=trainable)
 
             self.b_1 = tf.Variable(tf.truncated_normal([n_hidden_1], stddev=0.1), trainable=trainable)
             self.b_2 = tf.Variable(tf.truncated_normal([n_hidden_2], stddev=0.1), trainable=trainable)
             self.b_3 = tf.Variable(tf.truncated_normal([n_hidden_3], stddev=0.1), trainable=trainable)
-            self.b_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            self.b_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            # Power Beta分布bias
+            self.b_power_alpha = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_power_beta = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
             self.b_RB = tf.Variable(tf.truncated_normal([self.n_RB], stddev=0.1), trainable=trainable)
-            # 新增：rho的bias（Normal分布，与power相同）
-            self.b_rho_mu = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
-            self.b_rho_sigma = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            # Rho Beta分布bias
+            self.b_rho_alpha = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
+            self.b_rho_beta = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
             self.b_v = tf.Variable(tf.truncated_normal([1], stddev=0.1), trainable=trainable)
 
             layer_p1 = tf.nn.relu(tf.add(tf.matmul(self.s_input, self.w_1), self.b_1), name='p_1')
@@ -288,20 +299,22 @@ class PPO(object):
             critic_input = layer_3_b  # For critic
             
             # Actor heads
-            mu = tf.nn.tanh(tf.add(tf.matmul(layer_2_b, self.w_mu), self.b_mu), name='mu_layer')
-            sigma = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_sigma), self.b_sigma), name='sigma_layer')
             RB_probs = tf.nn.softmax(tf.add(tf.matmul(layer_2_b, self.w_RB), self.b_RB), name='RB_layer')
             RB_distribution = tf.distributions.Categorical(probs=RB_probs)
             
-            # 新增：rho的Normal分布（与power相同的方式，压缩比 rho ∈ [0,1]）
-            # 使用sigmoid将mu映射到[0,1]范围
-            rho_mu = tf.nn.sigmoid(tf.add(tf.matmul(layer_2_b, self.w_rho_mu), self.b_rho_mu), name='rho_mu_layer')
-            rho_sigma = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_sigma), self.b_rho_sigma), name='rho_sigma_layer')
-            rho_mu, rho_sigma = rho_mu, rho_sigma + sigma_add
-            rho_distribution = tf.distributions.Normal(loc=rho_mu, scale=rho_sigma)
+            # Power Beta分布：alpha和beta参数（确保>1以避免极端值）
+            power_alpha_raw = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_power_alpha), self.b_power_alpha), name='power_alpha_layer')
+            power_beta_raw = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_power_beta), self.b_power_beta), name='power_beta_layer')
+            power_alpha = power_alpha_raw + 1.0  # 确保alpha > 1
+            power_beta = power_beta_raw + 1.0    # 确保beta > 1
+            power_distribution = tf.distributions.Beta(concentration1=power_alpha, concentration0=power_beta)
             
-            mu, sigma = mu, sigma + sigma_add
-            norm_dist = tf.distributions.Normal(loc=mu, scale=sigma)
+            # Rho Beta分布：alpha和beta参数（确保>1以避免极端值）
+            rho_alpha_raw = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_alpha), self.b_rho_alpha), name='rho_alpha_layer')
+            rho_beta_raw = tf.nn.softplus(tf.add(tf.matmul(layer_2_b, self.w_rho_beta), self.b_rho_beta), name='rho_beta_layer')
+            rho_alpha = rho_alpha_raw + 1.0  # 确保alpha > 1
+            rho_beta = rho_beta_raw + 1.0    # 确保beta > 1
+            rho_distribution = tf.distributions.Beta(concentration1=rho_alpha, concentration0=rho_beta)
             
             # Critic network (MLP)
             v = tf.nn.relu(tf.add(tf.matmul(critic_input, self.w_v), self.b_v), name='v_layer')
@@ -309,7 +322,7 @@ class PPO(object):
             saver = tf.train.Saver(max_to_keep=self.n_veh * 2)
             
         params = tf.global_variables(scope)
-        return norm_dist, RB_distribution, rho_distribution, v, params, saver
+        return power_distribution, RB_distribution, rho_distribution, v, params, saver
 
     def get_v(self, s, sess, node_features=None, adj_matrix=None, agent_idx=0):
         """
@@ -340,9 +353,11 @@ class PPO(object):
         a = np.squeeze(sess.run(self.choose_action_op, {self.s_input: s[np.newaxis, :]}))
         
         clipped_a = np.zeros(self.a_dim)
-        clipped_a[0] = a[0]
+        clipped_a[0] = a[0]  # RB (Categorical)
+        # Power已经是Beta分布映射后的值，在[-bound, bound]范围内，但为了安全还是clip一下
         clipped_a[1] = np.clip(a[1], -self.a_bound[1], self.a_bound[1])
-        clipped_a[2] = np.clip(a[2], 0.0, 1.0)  # rho ∈ [0,1]
+        # Rho是Beta分布输出，天然在[0,1]范围内，但为了安全还是clip一下
+        clipped_a[2] = np.clip(a[2], 0.0, 1.0)
         return clipped_a
 
     def train(self, s, a, gae, reward, v_pred_next, sess, node_features=None, adj_matrix=None, agent_idx=0):
@@ -423,79 +438,6 @@ class PPO(object):
                 gaes[t] = gaes[t] + self.gamma * self.GAE_discount * gaes[t + 1]
             return gaes
 
-    def averaging_model(self, success_rate):
-        # 仅保留 MLP 模式下的手工参数平均（联邦学习）
-        mu = 0
-        sigma = 1e-8
-        w_1_mean = np.random.normal(0, sigma, [self.s_dim, n_hidden_1])
-        w_2_mean = np.random.normal(0, sigma, [n_hidden_1, n_hidden_2])
-        w_3_mean = np.random.normal(0, sigma, [n_hidden_2, n_hidden_3])
-        w_mu_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_sigma_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_RB_mean = np.random.normal(0, sigma, [n_hidden_2, self.n_RB])
-        # 新增：rho参数平均
-        w_rho_mu_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_rho_sigma_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_v_mean = np.random.normal(0, sigma, [n_hidden_3, 1])
-
-        b_1_mean = np.random.normal(0, sigma, [n_hidden_1])
-        b_2_mean = np.random.normal(0, sigma, [n_hidden_2])
-        b_3_mean = np.random.normal(0, sigma, [n_hidden_3])
-        b_mu_mean = np.random.normal(0, sigma, [1])
-        b_sigma_mean = np.random.normal(0, sigma, [1])
-        b_RB_mean = np.random.normal(0, sigma, [self.n_RB])
-        # 新增：rho bias平均
-        b_rho_mu_mean = np.random.normal(0, sigma, [1])
-        b_rho_sigma_mean = np.random.normal(0, sigma, [1])
-        b_v_mean = np.random.normal(0, sigma, [1])
-
-        for i in range(self.n_veh):
-            w_1_mean += self.sesses[i].run(self.w_1) / self.n_veh
-            w_2_mean += self.sesses[i].run(self.w_2) / self.n_veh
-            w_3_mean += self.sesses[i].run(self.w_3) / self.n_veh
-            w_mu_mean += self.sesses[i].run(self.w_mu) / self.n_veh
-            w_sigma_mean += self.sesses[i].run(self.w_sigma) / self.n_veh
-            w_RB_mean += self.sesses[i].run(self.w_RB) / self.n_veh
-            # 新增：rho参数聚合
-            w_rho_mu_mean += self.sesses[i].run(self.w_rho_mu) / self.n_veh
-            w_rho_sigma_mean += self.sesses[i].run(self.w_rho_sigma) / self.n_veh
-            w_v_mean += self.sesses[i].run(self.w_v) / self.n_veh
-
-            b_1_mean += self.sesses[i].run(self.b_1) / self.n_veh
-            b_2_mean += self.sesses[i].run(self.b_2) / self.n_veh
-            b_3_mean += self.sesses[i].run(self.b_3) / self.n_veh
-            b_mu_mean += self.sesses[i].run(self.b_mu) / self.n_veh
-            b_sigma_mean += self.sesses[i].run(self.b_sigma) / self.n_veh
-            b_RB_mean += self.sesses[i].run(self.b_RB) / self.n_veh
-            # 新增：rho bias聚合
-            b_rho_mu_mean += self.sesses[i].run(self.b_rho_mu) / self.n_veh
-            b_rho_sigma_mean += self.sesses[i].run(self.b_rho_sigma) / self.n_veh
-            b_v_mean += self.sesses[i].run(self.b_v) / self.n_veh
-
-        for i in range(self.n_veh):
-            self.sesses[i].run(self.w_1.assign(w_1_mean))
-            self.sesses[i].run(self.w_2.assign(w_2_mean))
-            self.sesses[i].run(self.w_3.assign(w_3_mean))
-            self.sesses[i].run(self.w_mu.assign(w_mu_mean))
-            self.sesses[i].run(self.w_sigma.assign(w_sigma_mean))
-            self.sesses[i].run(self.w_RB.assign(w_RB_mean))
-            # 新增：rho参数分发
-            self.sesses[i].run(self.w_rho_mu.assign(w_rho_mu_mean))
-            self.sesses[i].run(self.w_rho_sigma.assign(w_rho_sigma_mean))
-            self.sesses[i].run(self.w_v.assign(w_v_mean))
-
-            self.sesses[i].run(self.b_1.assign(b_1_mean))
-            self.sesses[i].run(self.b_2.assign(b_2_mean))
-            self.sesses[i].run(self.b_3.assign(b_3_mean))
-            self.sesses[i].run(self.b_mu.assign(b_mu_mean))
-            self.sesses[i].run(self.b_sigma.assign(b_sigma_mean))
-            self.sesses[i].run(self.b_RB.assign(b_RB_mean))
-            # 新增：rho bias分发
-            self.sesses[i].run(self.b_rho_mu.assign(b_rho_mu_mean))
-            self.sesses[i].run(self.b_rho_sigma.assign(b_rho_sigma_mean))
-            self.sesses[i].run(self.b_v.assign(b_v_mean))
-        return
-
     def get_gaes(self, rewards, v_preds, v_preds_next):
         """
         GAE
@@ -541,72 +483,86 @@ class PPO(object):
 
     def averaging_model(self, success_rate):
         # 仅保留 MLP 模式下的手工参数平均（联邦学习）
-        mu = 0
+        # 注意：已更新为Beta分布参数
+        # 改进：使用基于success_rate的加权聚合，而不是简单平均
         sigma = 1e-8
+        
+        # 处理success_rate：转换为权重
+        if success_rate is not None and len(success_rate) > 0:
+            # 将success_rate归一化为权重（避免除零）
+            success_rate = np.array(success_rate)
+            success_rate = np.clip(success_rate, 0.0, 1.0)  # 确保在[0,1]范围内
+            # 添加小的epsilon避免全零情况
+            weights = success_rate + 1e-6
+            weights = weights / weights.sum()  # 归一化
+        else:
+            # 如果没有success_rate，使用均匀权重
+            weights = np.ones(self.n_veh) / self.n_veh
+        
         w_1_mean = np.random.normal(0, sigma, [self.s_dim, n_hidden_1])
         w_2_mean = np.random.normal(0, sigma, [n_hidden_1, n_hidden_2])
         w_3_mean = np.random.normal(0, sigma, [n_hidden_2, n_hidden_3])
-        w_mu_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_sigma_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
+        # Power Beta分布参数
+        w_power_alpha_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
+        w_power_beta_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
         w_RB_mean = np.random.normal(0, sigma, [n_hidden_2, self.n_RB])
-        # 新增：rho参数平均
-        w_rho_mu_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_rho_sigma_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
+        # Rho Beta分布参数
+        w_rho_alpha_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
+        w_rho_beta_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
         w_v_mean = np.random.normal(0, sigma, [n_hidden_3, 1])
 
         b_1_mean = np.random.normal(0, sigma, [n_hidden_1])
         b_2_mean = np.random.normal(0, sigma, [n_hidden_2])
         b_3_mean = np.random.normal(0, sigma, [n_hidden_3])
-        b_mu_mean = np.random.normal(0, sigma, [1])
-        b_sigma_mean = np.random.normal(0, sigma, [1])
+        # Power Beta分布bias
+        b_power_alpha_mean = np.random.normal(0, sigma, [1])
+        b_power_beta_mean = np.random.normal(0, sigma, [1])
         b_RB_mean = np.random.normal(0, sigma, [self.n_RB])
-        # 新增：rho bias平均
-        b_rho_mu_mean = np.random.normal(0, sigma, [1])
-        b_rho_sigma_mean = np.random.normal(0, sigma, [1])
+        # Rho Beta分布bias
+        b_rho_alpha_mean = np.random.normal(0, sigma, [1])
+        b_rho_beta_mean = np.random.normal(0, sigma, [1])
         b_v_mean = np.random.normal(0, sigma, [1])
 
+        # 使用加权聚合（基于success_rate）
         for i in range(self.n_veh):
-            w_1_mean += self.sesses[i].run(self.w_1) / self.n_veh
-            w_2_mean += self.sesses[i].run(self.w_2) / self.n_veh
-            w_3_mean += self.sesses[i].run(self.w_3) / self.n_veh
-            w_mu_mean += self.sesses[i].run(self.w_mu) / self.n_veh
-            w_sigma_mean += self.sesses[i].run(self.w_sigma) / self.n_veh
-            w_RB_mean += self.sesses[i].run(self.w_RB) / self.n_veh
-            # 新增：rho参数聚合
-            w_rho_mu_mean += self.sesses[i].run(self.w_rho_mu) / self.n_veh
-            w_rho_sigma_mean += self.sesses[i].run(self.w_rho_sigma) / self.n_veh
-            w_v_mean += self.sesses[i].run(self.w_v) / self.n_veh
+            weight = weights[i]
+            w_1_mean += self.sesses[i].run(self.w_1) * weight
+            w_2_mean += self.sesses[i].run(self.w_2) * weight
+            w_3_mean += self.sesses[i].run(self.w_3) * weight
+            w_power_alpha_mean += self.sesses[i].run(self.w_power_alpha) * weight
+            w_power_beta_mean += self.sesses[i].run(self.w_power_beta) * weight
+            w_RB_mean += self.sesses[i].run(self.w_RB) * weight
+            w_rho_alpha_mean += self.sesses[i].run(self.w_rho_alpha) * weight
+            w_rho_beta_mean += self.sesses[i].run(self.w_rho_beta) * weight
+            w_v_mean += self.sesses[i].run(self.w_v) * weight
 
-            b_1_mean += self.sesses[i].run(self.b_1) / self.n_veh
-            b_2_mean += self.sesses[i].run(self.b_2) / self.n_veh
-            b_3_mean += self.sesses[i].run(self.b_3) / self.n_veh
-            b_mu_mean += self.sesses[i].run(self.b_mu) / self.n_veh
-            b_sigma_mean += self.sesses[i].run(self.b_sigma) / self.n_veh
-            b_RB_mean += self.sesses[i].run(self.b_RB) / self.n_veh
-            # 新增：rho bias聚合
-            b_rho_mu_mean += self.sesses[i].run(self.b_rho_mu) / self.n_veh
-            b_rho_sigma_mean += self.sesses[i].run(self.b_rho_sigma) / self.n_veh
-            b_v_mean += self.sesses[i].run(self.b_v) / self.n_veh
+            b_1_mean += self.sesses[i].run(self.b_1) * weight
+            b_2_mean += self.sesses[i].run(self.b_2) * weight
+            b_3_mean += self.sesses[i].run(self.b_3) * weight
+            b_power_alpha_mean += self.sesses[i].run(self.b_power_alpha) * weight
+            b_power_beta_mean += self.sesses[i].run(self.b_power_beta) * weight
+            b_RB_mean += self.sesses[i].run(self.b_RB) * weight
+            b_rho_alpha_mean += self.sesses[i].run(self.b_rho_alpha) * weight
+            b_rho_beta_mean += self.sesses[i].run(self.b_rho_beta) * weight
+            b_v_mean += self.sesses[i].run(self.b_v) * weight
 
         for i in range(self.n_veh):
             self.sesses[i].run(self.w_1.assign(w_1_mean))
             self.sesses[i].run(self.w_2.assign(w_2_mean))
             self.sesses[i].run(self.w_3.assign(w_3_mean))
-            self.sesses[i].run(self.w_mu.assign(w_mu_mean))
-            self.sesses[i].run(self.w_sigma.assign(w_sigma_mean))
+            self.sesses[i].run(self.w_power_alpha.assign(w_power_alpha_mean))
+            self.sesses[i].run(self.w_power_beta.assign(w_power_beta_mean))
             self.sesses[i].run(self.w_RB.assign(w_RB_mean))
-            # 新增：rho参数分发
-            self.sesses[i].run(self.w_rho_mu.assign(w_rho_mu_mean))
-            self.sesses[i].run(self.w_rho_sigma.assign(w_rho_sigma_mean))
+            self.sesses[i].run(self.w_rho_alpha.assign(w_rho_alpha_mean))
+            self.sesses[i].run(self.w_rho_beta.assign(w_rho_beta_mean))
             self.sesses[i].run(self.w_v.assign(w_v_mean))
 
             self.sesses[i].run(self.b_1.assign(b_1_mean))
             self.sesses[i].run(self.b_2.assign(b_2_mean))
             self.sesses[i].run(self.b_3.assign(b_3_mean))
-            self.sesses[i].run(self.b_mu.assign(b_mu_mean))
-            self.sesses[i].run(self.b_sigma.assign(b_sigma_mean))
+            self.sesses[i].run(self.b_power_alpha.assign(b_power_alpha_mean))
+            self.sesses[i].run(self.b_power_beta.assign(b_power_beta_mean))
             self.sesses[i].run(self.b_RB.assign(b_RB_mean))
-            # 新增：rho bias分发
-            self.sesses[i].run(self.b_rho_mu.assign(b_rho_mu_mean))
-            self.sesses[i].run(self.b_rho_sigma.assign(b_rho_sigma_mean))
+            self.sesses[i].run(self.b_rho_alpha.assign(b_rho_alpha_mean))
+            self.sesses[i].run(self.b_rho_beta.assign(b_rho_beta_mean))
             self.sesses[i].run(self.b_v.assign(b_v_mean))

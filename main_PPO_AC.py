@@ -306,6 +306,13 @@ if training_mode:
 # 格式: Amax1.0_semB2.0 (语义A_max, 语义beta)
 log_name_parts.append(f"Amax{semantic_A_max}_semB{semantic_beta}")
 log_name_parts.append(f"UAV{n_veh}_RB{n_RB}")
+# 添加学习率到日志名
+log_name_parts.append(f"lr{args.lr_main}")
+# 如果启用联邦学习，添加聚合频率信息
+if IS_FL:
+    # 计算最大可能的聚合次数（在0.9*n_episode之前，每target_average_step步聚合一次）
+    max_fed_times = int(0.9 * n_episode / target_average_step)
+    log_name_parts.append(f"FL{target_average_step}_max{max_fed_times}")
 log_name = "_".join(log_name_parts)
 
 log_dir = f'./logs/tensorboard/{log_name}'
