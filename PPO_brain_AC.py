@@ -481,11 +481,24 @@ class PPO(object):
                 gaes[t] = gaes[t] + self.gamma * self.GAE_discount * gaes[t + 1]
             return gaes
 
-    def averaging_model(self, success_rate):
+    def averaging_model(self, success_rate, aggregation_weight=1.0):
+        """
+        联邦学习模型聚合
+        Args:
+            success_rate: 各UE的成功率，用于计算聚合权重
+            aggregation_weight: 聚合权重（0.0-1.0）
+                - 1.0: 硬替换（完全使用聚合参数，原有逻辑）
+                - 0.7: 软聚合（70%聚合参数 + 30%本地参数）
+                - 0.0: 不聚合（仅用于测试）
+        """
         # 仅保留 MLP 模式下的手工参数平均（联邦学习）
         # 注意：已更新为Beta分布参数
         # 改进：使用基于success_rate的加权聚合，而不是简单平均
+        # 改进：支持软聚合（部分替换），保留部分本地参数
         sigma = 1e-8
+        
+        # 确保aggregation_weight在有效范围内
+        aggregation_weight = np.clip(aggregation_weight, 0.0, 1.0)
         
         # 处理success_rate：转换为权重
         if success_rate is not None and len(success_rate) > 0:
@@ -546,23 +559,70 @@ class PPO(object):
             b_rho_beta_mean += self.sesses[i].run(self.b_rho_beta) * weight
             b_v_mean += self.sesses[i].run(self.b_v) * weight
 
+        # 软聚合：混合聚合参数和本地参数
         for i in range(self.n_veh):
-            self.sesses[i].run(self.w_1.assign(w_1_mean))
-            self.sesses[i].run(self.w_2.assign(w_2_mean))
-            self.sesses[i].run(self.w_3.assign(w_3_mean))
-            self.sesses[i].run(self.w_power_alpha.assign(w_power_alpha_mean))
-            self.sesses[i].run(self.w_power_beta.assign(w_power_beta_mean))
-            self.sesses[i].run(self.w_RB.assign(w_RB_mean))
-            self.sesses[i].run(self.w_rho_alpha.assign(w_rho_alpha_mean))
-            self.sesses[i].run(self.w_rho_beta.assign(w_rho_beta_mean))
-            self.sesses[i].run(self.w_v.assign(w_v_mean))
-
-            self.sesses[i].run(self.b_1.assign(b_1_mean))
-            self.sesses[i].run(self.b_2.assign(b_2_mean))
-            self.sesses[i].run(self.b_3.assign(b_3_mean))
-            self.sesses[i].run(self.b_power_alpha.assign(b_power_alpha_mean))
-            self.sesses[i].run(self.b_power_beta.assign(b_power_beta_mean))
-            self.sesses[i].run(self.b_RB.assign(b_RB_mean))
-            self.sesses[i].run(self.b_rho_alpha.assign(b_rho_alpha_mean))
-            self.sesses[i].run(self.b_rho_beta.assign(b_rho_beta_mean))
-            self.sesses[i].run(self.b_v.assign(b_v_mean))
+            if aggregation_weight < 1.0:
+                # 软聚合：保留部分本地参数
+                # 获取当前本地参数
+                old_w_1 = self.sesses[i].run(self.w_1)
+                old_w_2 = self.sesses[i].run(self.w_2)
+                old_w_3 = self.sesses[i].run(self.w_3)
+                old_w_power_alpha = self.sesses[i].run(self.w_power_alpha)
+                old_w_power_beta = self.sesses[i].run(self.w_power_beta)
+                old_w_RB = self.sesses[i].run(self.w_RB)
+                old_w_rho_alpha = self.sesses[i].run(self.w_rho_alpha)
+                old_w_rho_beta = self.sesses[i].run(self.w_rho_beta)
+                old_w_v = self.sesses[i].run(self.w_v)
+                
+                old_b_1 = self.sesses[i].run(self.b_1)
+                old_b_2 = self.sesses[i].run(self.b_2)
+                old_b_3 = self.sesses[i].run(self.b_3)
+                old_b_power_alpha = self.sesses[i].run(self.b_power_alpha)
+                old_b_power_beta = self.sesses[i].run(self.b_power_beta)
+                old_b_RB = self.sesses[i].run(self.b_RB)
+                old_b_rho_alpha = self.sesses[i].run(self.b_rho_alpha)
+                old_b_rho_beta = self.sesses[i].run(self.b_rho_beta)
+                old_b_v = self.sesses[i].run(self.b_v)
+                
+                # 软聚合：混合新旧参数
+                # new_param = aggregation_weight * aggregated_param + (1 - aggregation_weight) * local_param
+                self.sesses[i].run(self.w_1.assign(aggregation_weight * w_1_mean + (1 - aggregation_weight) * old_w_1))
+                self.sesses[i].run(self.w_2.assign(aggregation_weight * w_2_mean + (1 - aggregation_weight) * old_w_2))
+                self.sesses[i].run(self.w_3.assign(aggregation_weight * w_3_mean + (1 - aggregation_weight) * old_w_3))
+                self.sesses[i].run(self.w_power_alpha.assign(aggregation_weight * w_power_alpha_mean + (1 - aggregation_weight) * old_w_power_alpha))
+                self.sesses[i].run(self.w_power_beta.assign(aggregation_weight * w_power_beta_mean + (1 - aggregation_weight) * old_w_power_beta))
+                self.sesses[i].run(self.w_RB.assign(aggregation_weight * w_RB_mean + (1 - aggregation_weight) * old_w_RB))
+                self.sesses[i].run(self.w_rho_alpha.assign(aggregation_weight * w_rho_alpha_mean + (1 - aggregation_weight) * old_w_rho_alpha))
+                self.sesses[i].run(self.w_rho_beta.assign(aggregation_weight * w_rho_beta_mean + (1 - aggregation_weight) * old_w_rho_beta))
+                self.sesses[i].run(self.w_v.assign(aggregation_weight * w_v_mean + (1 - aggregation_weight) * old_w_v))
+                
+                self.sesses[i].run(self.b_1.assign(aggregation_weight * b_1_mean + (1 - aggregation_weight) * old_b_1))
+                self.sesses[i].run(self.b_2.assign(aggregation_weight * b_2_mean + (1 - aggregation_weight) * old_b_2))
+                self.sesses[i].run(self.b_3.assign(aggregation_weight * b_3_mean + (1 - aggregation_weight) * old_b_3))
+                self.sesses[i].run(self.b_power_alpha.assign(aggregation_weight * b_power_alpha_mean + (1 - aggregation_weight) * old_b_power_alpha))
+                self.sesses[i].run(self.b_power_beta.assign(aggregation_weight * b_power_beta_mean + (1 - aggregation_weight) * old_b_power_beta))
+                self.sesses[i].run(self.b_RB.assign(aggregation_weight * b_RB_mean + (1 - aggregation_weight) * old_b_RB))
+                self.sesses[i].run(self.b_rho_alpha.assign(aggregation_weight * b_rho_alpha_mean + (1 - aggregation_weight) * old_b_rho_alpha))
+                self.sesses[i].run(self.b_rho_beta.assign(aggregation_weight * b_rho_beta_mean + (1 - aggregation_weight) * old_b_rho_beta))
+                self.sesses[i].run(self.b_v.assign(aggregation_weight * b_v_mean + (1 - aggregation_weight) * old_b_v))
+            else:
+                # 硬替换（原有逻辑）：完全使用聚合参数
+                self.sesses[i].run(self.w_1.assign(w_1_mean))
+                self.sesses[i].run(self.w_2.assign(w_2_mean))
+                self.sesses[i].run(self.w_3.assign(w_3_mean))
+                self.sesses[i].run(self.w_power_alpha.assign(w_power_alpha_mean))
+                self.sesses[i].run(self.w_power_beta.assign(w_power_beta_mean))
+                self.sesses[i].run(self.w_RB.assign(w_RB_mean))
+                self.sesses[i].run(self.w_rho_alpha.assign(w_rho_alpha_mean))
+                self.sesses[i].run(self.w_rho_beta.assign(w_rho_beta_mean))
+                self.sesses[i].run(self.w_v.assign(w_v_mean))
+                
+                self.sesses[i].run(self.b_1.assign(b_1_mean))
+                self.sesses[i].run(self.b_2.assign(b_2_mean))
+                self.sesses[i].run(self.b_3.assign(b_3_mean))
+                self.sesses[i].run(self.b_power_alpha.assign(b_power_alpha_mean))
+                self.sesses[i].run(self.b_power_beta.assign(b_power_beta_mean))
+                self.sesses[i].run(self.b_RB.assign(b_RB_mean))
+                self.sesses[i].run(self.b_rho_alpha.assign(b_rho_alpha_mean))
+                self.sesses[i].run(self.b_rho_beta.assign(b_rho_beta_mean))
+                self.sesses[i].run(self.b_v.assign(b_v_mean))

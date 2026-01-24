@@ -126,6 +126,21 @@ def get_args():
         default=False,
         help='if use federated learning (model averaging) (default: False)')
     parser.add_argument(
+        '--fl_adaptive_interval',
+        action='store_true',
+        default=False,
+        help='if use adaptive aggregation interval (stage-based training) (default: False)')
+    parser.add_argument(
+        '--fl_soft_aggregation',
+        action='store_true',
+        default=False,
+        help='if use soft aggregation (partial replacement) instead of hard replacement (default: False)')
+    parser.add_argument(
+        '--fl_aggregation_weight',
+        type=float,
+        default=0.7,
+        help='aggregation weight for soft aggregation (0.0-1.0, 1.0=hard replacement, 0.7=soft aggregation) (default: 0.7, only used when --fl_soft_aggregation is enabled)')
+    parser.add_argument(
         '--fl_average_actor',
         action='store_true',
         default=False,

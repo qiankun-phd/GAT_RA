@@ -29,6 +29,9 @@ target_average_step = args.target_average_step
 IS_PPO = args.IS_PPO
 IS_meta = args.Do_meta
 IS_FL = args.Do_FL
+IS_FL_adaptive = args.fl_adaptive_interval  # 自适应聚合频率开关
+IS_FL_soft = args.fl_soft_aggregation  # 软聚合开关
+FL_aggregation_weight = args.fl_aggregation_weight  # 软聚合权重（仅在软聚合启用时使用）
 n_veh = args.n_veh
 n_RB = args.n_RB
 
@@ -308,11 +311,25 @@ log_name_parts.append(f"Amax{semantic_A_max}_semB{semantic_beta}")
 log_name_parts.append(f"UAV{n_veh}_RB{n_RB}")
 # 添加学习率到日志名
 log_name_parts.append(f"lr{args.lr_main}")
-# 如果启用联邦学习，添加聚合频率信息
+# 如果启用联邦学习，添加聚合频率信息和改进方式
 if IS_FL:
     # 计算最大可能的聚合次数（在0.9*n_episode之前，每target_average_step步聚合一次）
     max_fed_times = int(0.9 * n_episode / target_average_step)
-    log_name_parts.append(f"FL{target_average_step}_max{max_fed_times}")
+    
+    # 构建FL配置字符串
+    fl_config_parts = [f"FL{target_average_step}_max{max_fed_times}"]
+    
+    # 添加自适应聚合频率标识
+    if IS_FL_adaptive:
+        fl_config_parts.append("Adapt")
+    
+    # 添加软聚合标识
+    if IS_FL_soft:
+        # 将权重转换为字符串（例如：0.7 -> "S07"）
+        weight_str = f"S{int(FL_aggregation_weight * 100):02d}"
+        fl_config_parts.append(weight_str)
+    
+    log_name_parts.append("_".join(fl_config_parts))
 log_name = "_".join(log_name_parts)
 
 log_dir = f'./logs/tensorboard/{log_name}'
@@ -409,10 +426,43 @@ for episode_idx in range(n_episode):
             ppoes.save_models('PPO_no_meta_AC_' + label_early)
 
     # 联邦学习：模型平均
-    if IS_FL and i_episode % target_average_step == target_average_step - 1 and i_episode < 0.9 * n_episode:
-        print('Model averaged ' + '%d' % current_fed_times)
-        current_fed_times = current_fed_times + 1
-        ppoes.averaging_model(success_rate)
+    # 自适应聚合频率：根据训练阶段调整聚合间隔
+    if IS_FL:
+        if IS_FL_adaptive:
+            # 自适应聚合频率：阶段化训练
+            if i_episode < n_episode * 0.3:
+                # 早期（前30%）：较少聚合，让元学习充分发挥
+                aggregation_interval = target_average_step * 2  # 200步
+                stage = "early"
+            elif i_episode < n_episode * 0.7:
+                # 中期（30%-70%）：正常聚合
+                aggregation_interval = target_average_step  # 100步
+                stage = "mid"
+            else:
+                # 后期（70%-90%）：更频繁聚合，利用协作优势
+                aggregation_interval = max(target_average_step // 2, 10)  # 50步（至少10步）
+                stage = "late"
+        else:
+            # 原有逻辑：固定聚合频率
+            aggregation_interval = target_average_step
+            stage = "fixed"
+        
+        # 检查是否到达聚合时机
+        should_aggregate = (i_episode % aggregation_interval == aggregation_interval - 1) and (i_episode < 0.9 * n_episode)
+        
+        if should_aggregate:
+            if IS_FL_adaptive:
+                print(f'Model averaged (stage: {stage}, interval: {aggregation_interval}) ' + '%d' % current_fed_times)
+            else:
+                print('Model averaged ' + '%d' % current_fed_times)
+            current_fed_times = current_fed_times + 1
+            
+            # 传递软聚合参数
+            if IS_FL_soft:
+                ppoes.averaging_model(success_rate, aggregation_weight=FL_aggregation_weight)
+            else:
+                # 原有逻辑：硬替换（aggregation_weight=1.0）
+                ppoes.averaging_model(success_rate, aggregation_weight=1.0)
 
 label_base = '%d_' %target_average_step+ '%d_' %n_veh + '%d_' %n_episode + '%s_' %args.lr_main + '%s_' %args.sigma_add + '%s_' %env_label
 if IS_meta:
