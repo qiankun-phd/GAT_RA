@@ -141,6 +141,21 @@ def get_args():
         default=0.7,
         help='aggregation weight for soft aggregation (0.0-1.0, 1.0=hard replacement, 0.7=soft aggregation) (default: 0.7, only used when --fl_soft_aggregation is enabled)')
     parser.add_argument(
+        '--fl_layer_wise',
+        action='store_true',
+        default=False,
+        help='if use layer-wise federated aggregation (only aggregate encoder layers, keep decision heads personalized) (default: False)')
+    parser.add_argument(
+        '--fl_semantic_weighting',
+        action='store_true',
+        default=False,
+        help='if use semantic-aware weighting based on Semantic Energy Efficiency (SEE) instead of success rate (default: False)')
+    parser.add_argument(
+        '--fl_semantic_temperature',
+        type=float,
+        default=0.5,
+        help='temperature coefficient for semantic weighting softmax (smaller=more emphasis on good agents) (default: 0.5)')
+    parser.add_argument(
         '--fl_average_actor',
         action='store_true',
         default=False,

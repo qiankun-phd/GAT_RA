@@ -481,15 +481,21 @@ class PPO(object):
                 gaes[t] = gaes[t] + self.gamma * self.GAE_discount * gaes[t + 1]
             return gaes
 
-    def averaging_model(self, success_rate, aggregation_weight=1.0):
+    def averaging_model(self, success_rate, aggregation_weight=1.0, layer_wise=False, external_weights=None):
         """
         联邦学习模型聚合
         Args:
-            success_rate: 各UE的成功率，用于计算聚合权重
+            success_rate: 各UE的成功率，用于计算聚合权重（当external_weights为None时使用）
             aggregation_weight: 聚合权重（0.0-1.0）
                 - 1.0: 硬替换（完全使用聚合参数，原有逻辑）
                 - 0.7: 软聚合（70%聚合参数 + 30%本地参数）
                 - 0.0: 不聚合（仅用于测试）
+            layer_wise: 分层联邦聚合开关（默认False）
+                - True: 只聚合特征提取层(w_1,w_2,b_1,b_2)，保留决策层个性化
+                - False: 聚合所有网络参数（标准联邦学习）
+            external_weights: 外部提供的聚合权重（如语义感知权重）
+                - 如果提供，将优先使用此权重而非success_rate计算的权重
+                - 应为归一化的numpy数组，长度为n_veh
         """
         # 仅保留 MLP 模式下的手工参数平均（联邦学习）
         # 注意：已更新为Beta分布参数
@@ -500,129 +506,190 @@ class PPO(object):
         # 确保aggregation_weight在有效范围内
         aggregation_weight = np.clip(aggregation_weight, 0.0, 1.0)
         
-        # 处理success_rate：转换为权重
-        if success_rate is not None and len(success_rate) > 0:
+        # 打印分层聚合状态
+        if layer_wise:
+            print("🔄 分层联邦聚合: 只聚合特征提取层(w_1,w_2,b_1,b_2)，保留决策层个性化")
+        else:
+            print("🔄 标准联邦聚合: 聚合所有网络参数")
+        
+        # 处理权重：优先使用external_weights，否则使用success_rate
+        if external_weights is not None:
+            # 使用外部提供的权重（如语义感知权重）
+            weights = np.array(external_weights)
+            # 确保权重归一化
+            weights = weights / (weights.sum() + 1e-8)
+            print(f"🔄 使用语义感知权重: {np.round(weights, 3)}")
+        elif success_rate is not None and len(success_rate) > 0:
             # 将success_rate归一化为权重（避免除零）
             success_rate = np.array(success_rate)
             success_rate = np.clip(success_rate, 0.0, 1.0)  # 确保在[0,1]范围内
             # 添加小的epsilon避免全零情况
             weights = success_rate + 1e-6
             weights = weights / weights.sum()  # 归一化
+            print(f"🔄 使用成功率权重: {np.round(weights, 3)}")
         else:
-            # 如果没有success_rate，使用均匀权重
+            # 如果没有权重信息，使用均匀权重
             weights = np.ones(self.n_veh) / self.n_veh
+            print(f"🔄 使用均匀权重: {np.round(weights, 3)}")
         
-        w_1_mean = np.random.normal(0, sigma, [self.s_dim, n_hidden_1])
-        w_2_mean = np.random.normal(0, sigma, [n_hidden_1, n_hidden_2])
-        w_3_mean = np.random.normal(0, sigma, [n_hidden_2, n_hidden_3])
-        # Power Beta分布参数
-        w_power_alpha_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_power_beta_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_RB_mean = np.random.normal(0, sigma, [n_hidden_2, self.n_RB])
-        # Rho Beta分布参数
-        w_rho_alpha_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_rho_beta_mean = np.random.normal(0, sigma, [n_hidden_2, 1])
-        w_v_mean = np.random.normal(0, sigma, [n_hidden_3, 1])
+        # 特征提取层 (Encoder) - 始终聚合
+        # 修复：累加器必须从零开始，不能从随机数开始！
+        w_1_mean = np.zeros([self.s_dim, n_hidden_1])
+        w_2_mean = np.zeros([n_hidden_1, n_hidden_2])
+        b_1_mean = np.zeros([n_hidden_1])
+        b_2_mean = np.zeros([n_hidden_2])
+        
+        # 决策层 (Task-specific Heads) - 只有在非分层模式下才聚合
+        if not layer_wise:
+            w_3_mean = np.zeros([n_hidden_2, n_hidden_3])
+            # Power Beta分布参数
+            w_power_alpha_mean = np.zeros([n_hidden_2, 1])
+            w_power_beta_mean = np.zeros([n_hidden_2, 1])
+            w_RB_mean = np.zeros([n_hidden_2, self.n_RB])
+            # Rho Beta分布参数
+            w_rho_alpha_mean = np.zeros([n_hidden_2, 1])
+            w_rho_beta_mean = np.zeros([n_hidden_2, 1])
+            w_v_mean = np.zeros([n_hidden_3, 1])
+            
+            b_3_mean = np.zeros([n_hidden_3])
+            # Power Beta分布bias
+            b_power_alpha_mean = np.zeros([1])
+            b_power_beta_mean = np.zeros([1])
+            b_RB_mean = np.zeros([self.n_RB])
+            # Rho Beta分布bias
+            b_rho_alpha_mean = np.zeros([1])
+            b_rho_beta_mean = np.zeros([1])
+            b_v_mean = np.zeros([1])
 
-        b_1_mean = np.random.normal(0, sigma, [n_hidden_1])
-        b_2_mean = np.random.normal(0, sigma, [n_hidden_2])
-        b_3_mean = np.random.normal(0, sigma, [n_hidden_3])
-        # Power Beta分布bias
-        b_power_alpha_mean = np.random.normal(0, sigma, [1])
-        b_power_beta_mean = np.random.normal(0, sigma, [1])
-        b_RB_mean = np.random.normal(0, sigma, [self.n_RB])
-        # Rho Beta分布bias
-        b_rho_alpha_mean = np.random.normal(0, sigma, [1])
-        b_rho_beta_mean = np.random.normal(0, sigma, [1])
-        b_v_mean = np.random.normal(0, sigma, [1])
-
-        # 使用加权聚合（基于success_rate）
+        # 使用加权聚合（基于权重）
+        # 验证：记录聚合前的参数范围，用于调试
+        param_ranges_before = {}
+        for i in range(self.n_veh):
+            w_1_sample = self.sesses[i].run(self.w_1)
+            param_ranges_before[i] = {
+                'w_1_min': np.min(w_1_sample),
+                'w_1_max': np.max(w_1_sample),
+                'w_1_mean': np.mean(w_1_sample)
+            }
+        
         for i in range(self.n_veh):
             weight = weights[i]
+            # 特征提取层 (Encoder) - 始终聚合
             w_1_mean += self.sesses[i].run(self.w_1) * weight
             w_2_mean += self.sesses[i].run(self.w_2) * weight
-            w_3_mean += self.sesses[i].run(self.w_3) * weight
-            w_power_alpha_mean += self.sesses[i].run(self.w_power_alpha) * weight
-            w_power_beta_mean += self.sesses[i].run(self.w_power_beta) * weight
-            w_RB_mean += self.sesses[i].run(self.w_RB) * weight
-            w_rho_alpha_mean += self.sesses[i].run(self.w_rho_alpha) * weight
-            w_rho_beta_mean += self.sesses[i].run(self.w_rho_beta) * weight
-            w_v_mean += self.sesses[i].run(self.w_v) * weight
-
             b_1_mean += self.sesses[i].run(self.b_1) * weight
             b_2_mean += self.sesses[i].run(self.b_2) * weight
-            b_3_mean += self.sesses[i].run(self.b_3) * weight
-            b_power_alpha_mean += self.sesses[i].run(self.b_power_alpha) * weight
-            b_power_beta_mean += self.sesses[i].run(self.b_power_beta) * weight
-            b_RB_mean += self.sesses[i].run(self.b_RB) * weight
-            b_rho_alpha_mean += self.sesses[i].run(self.b_rho_alpha) * weight
-            b_rho_beta_mean += self.sesses[i].run(self.b_rho_beta) * weight
-            b_v_mean += self.sesses[i].run(self.b_v) * weight
+            
+            # 决策层 (Task-specific Heads) - 只有在非分层模式下才聚合
+            if not layer_wise:
+                w_3_mean += self.sesses[i].run(self.w_3) * weight
+                w_power_alpha_mean += self.sesses[i].run(self.w_power_alpha) * weight
+                w_power_beta_mean += self.sesses[i].run(self.w_power_beta) * weight
+                w_RB_mean += self.sesses[i].run(self.w_RB) * weight
+                w_rho_alpha_mean += self.sesses[i].run(self.w_rho_alpha) * weight
+                w_rho_beta_mean += self.sesses[i].run(self.w_rho_beta) * weight
+                w_v_mean += self.sesses[i].run(self.w_v) * weight
+
+                b_3_mean += self.sesses[i].run(self.b_3) * weight
+                b_power_alpha_mean += self.sesses[i].run(self.b_power_alpha) * weight
+                b_power_beta_mean += self.sesses[i].run(self.b_power_beta) * weight
+                b_RB_mean += self.sesses[i].run(self.b_RB) * weight
+                b_rho_alpha_mean += self.sesses[i].run(self.b_rho_alpha) * weight
+                b_rho_beta_mean += self.sesses[i].run(self.b_rho_beta) * weight
+                b_v_mean += self.sesses[i].run(self.b_v) * weight
+        
+        # 验证：检查聚合后的参数范围
+        print(f"📊 聚合验证: w_1_mean范围=[{np.min(w_1_mean):.4f}, {np.max(w_1_mean):.4f}], 均值={np.mean(w_1_mean):.4f}")
+        if layer_wise:
+            print(f"📊 分层聚合: 只更新特征层(w_1,w_2,b_1,b_2)，决策层保持不变")
+        else:
+            print(f"📊 标准聚合: 更新所有层")
 
         # 软聚合：混合聚合参数和本地参数
         for i in range(self.n_veh):
             if aggregation_weight < 1.0:
                 # 软聚合：保留部分本地参数
-                # 获取当前本地参数
+                # 获取当前本地参数 - 特征提取层
                 old_w_1 = self.sesses[i].run(self.w_1)
                 old_w_2 = self.sesses[i].run(self.w_2)
-                old_w_3 = self.sesses[i].run(self.w_3)
-                old_w_power_alpha = self.sesses[i].run(self.w_power_alpha)
-                old_w_power_beta = self.sesses[i].run(self.w_power_beta)
-                old_w_RB = self.sesses[i].run(self.w_RB)
-                old_w_rho_alpha = self.sesses[i].run(self.w_rho_alpha)
-                old_w_rho_beta = self.sesses[i].run(self.w_rho_beta)
-                old_w_v = self.sesses[i].run(self.w_v)
-                
                 old_b_1 = self.sesses[i].run(self.b_1)
                 old_b_2 = self.sesses[i].run(self.b_2)
-                old_b_3 = self.sesses[i].run(self.b_3)
-                old_b_power_alpha = self.sesses[i].run(self.b_power_alpha)
-                old_b_power_beta = self.sesses[i].run(self.b_power_beta)
-                old_b_RB = self.sesses[i].run(self.b_RB)
-                old_b_rho_alpha = self.sesses[i].run(self.b_rho_alpha)
-                old_b_rho_beta = self.sesses[i].run(self.b_rho_beta)
-                old_b_v = self.sesses[i].run(self.b_v)
                 
-                # 软聚合：混合新旧参数
+                # 获取决策层参数（仅非分层模式需要）
+                if not layer_wise:
+                    old_w_3 = self.sesses[i].run(self.w_3)
+                    old_w_power_alpha = self.sesses[i].run(self.w_power_alpha)
+                    old_w_power_beta = self.sesses[i].run(self.w_power_beta)
+                    old_w_RB = self.sesses[i].run(self.w_RB)
+                    old_w_rho_alpha = self.sesses[i].run(self.w_rho_alpha)
+                    old_w_rho_beta = self.sesses[i].run(self.w_rho_beta)
+                    old_w_v = self.sesses[i].run(self.w_v)
+                    
+                    old_b_3 = self.sesses[i].run(self.b_3)
+                    old_b_power_alpha = self.sesses[i].run(self.b_power_alpha)
+                    old_b_power_beta = self.sesses[i].run(self.b_power_beta)
+                    old_b_RB = self.sesses[i].run(self.b_RB)
+                    old_b_rho_alpha = self.sesses[i].run(self.b_rho_alpha)
+                    old_b_rho_beta = self.sesses[i].run(self.b_rho_beta)
+                    old_b_v = self.sesses[i].run(self.b_v)
+                
+                # 软聚合：混合新旧参数 - 特征提取层
                 # new_param = aggregation_weight * aggregated_param + (1 - aggregation_weight) * local_param
-                self.sesses[i].run(self.w_1.assign(aggregation_weight * w_1_mean + (1 - aggregation_weight) * old_w_1))
-                self.sesses[i].run(self.w_2.assign(aggregation_weight * w_2_mean + (1 - aggregation_weight) * old_w_2))
-                self.sesses[i].run(self.w_3.assign(aggregation_weight * w_3_mean + (1 - aggregation_weight) * old_w_3))
-                self.sesses[i].run(self.w_power_alpha.assign(aggregation_weight * w_power_alpha_mean + (1 - aggregation_weight) * old_w_power_alpha))
-                self.sesses[i].run(self.w_power_beta.assign(aggregation_weight * w_power_beta_mean + (1 - aggregation_weight) * old_w_power_beta))
-                self.sesses[i].run(self.w_RB.assign(aggregation_weight * w_RB_mean + (1 - aggregation_weight) * old_w_RB))
-                self.sesses[i].run(self.w_rho_alpha.assign(aggregation_weight * w_rho_alpha_mean + (1 - aggregation_weight) * old_w_rho_alpha))
-                self.sesses[i].run(self.w_rho_beta.assign(aggregation_weight * w_rho_beta_mean + (1 - aggregation_weight) * old_w_rho_beta))
-                self.sesses[i].run(self.w_v.assign(aggregation_weight * w_v_mean + (1 - aggregation_weight) * old_w_v))
+                new_w_1 = aggregation_weight * w_1_mean + (1 - aggregation_weight) * old_w_1
+                new_w_2 = aggregation_weight * w_2_mean + (1 - aggregation_weight) * old_w_2
+                new_b_1 = aggregation_weight * b_1_mean + (1 - aggregation_weight) * old_b_1
+                new_b_2 = aggregation_weight * b_2_mean + (1 - aggregation_weight) * old_b_2
                 
-                self.sesses[i].run(self.b_1.assign(aggregation_weight * b_1_mean + (1 - aggregation_weight) * old_b_1))
-                self.sesses[i].run(self.b_2.assign(aggregation_weight * b_2_mean + (1 - aggregation_weight) * old_b_2))
-                self.sesses[i].run(self.b_3.assign(aggregation_weight * b_3_mean + (1 - aggregation_weight) * old_b_3))
-                self.sesses[i].run(self.b_power_alpha.assign(aggregation_weight * b_power_alpha_mean + (1 - aggregation_weight) * old_b_power_alpha))
-                self.sesses[i].run(self.b_power_beta.assign(aggregation_weight * b_power_beta_mean + (1 - aggregation_weight) * old_b_power_beta))
-                self.sesses[i].run(self.b_RB.assign(aggregation_weight * b_RB_mean + (1 - aggregation_weight) * old_b_RB))
-                self.sesses[i].run(self.b_rho_alpha.assign(aggregation_weight * b_rho_alpha_mean + (1 - aggregation_weight) * old_b_rho_alpha))
-                self.sesses[i].run(self.b_rho_beta.assign(aggregation_weight * b_rho_beta_mean + (1 - aggregation_weight) * old_b_rho_beta))
-                self.sesses[i].run(self.b_v.assign(aggregation_weight * b_v_mean + (1 - aggregation_weight) * old_b_v))
+                # 验证：检查软聚合是否生效（第一个智能体）
+                if i == 0:
+                    change_w_1 = np.mean(np.abs(new_w_1 - old_w_1))
+                    change_agg = np.mean(np.abs(w_1_mean - old_w_1))
+                    print(f"💡 软聚合验证 (Agent 0): w_1变化={change_w_1:.6f}, 硬替换变化={change_agg:.6f}, 软聚合比例={aggregation_weight:.2f}")
+                
+                self.sesses[i].run(self.w_1.assign(new_w_1))
+                self.sesses[i].run(self.w_2.assign(new_w_2))
+                self.sesses[i].run(self.b_1.assign(new_b_1))
+                self.sesses[i].run(self.b_2.assign(new_b_2))
+                
+                # 决策层：只有在非分层模式下才进行聚合更新
+                if not layer_wise:
+                    self.sesses[i].run(self.w_3.assign(aggregation_weight * w_3_mean + (1 - aggregation_weight) * old_w_3))
+                    self.sesses[i].run(self.w_power_alpha.assign(aggregation_weight * w_power_alpha_mean + (1 - aggregation_weight) * old_w_power_alpha))
+                    self.sesses[i].run(self.w_power_beta.assign(aggregation_weight * w_power_beta_mean + (1 - aggregation_weight) * old_w_power_beta))
+                    self.sesses[i].run(self.w_RB.assign(aggregation_weight * w_RB_mean + (1 - aggregation_weight) * old_w_RB))
+                    self.sesses[i].run(self.w_rho_alpha.assign(aggregation_weight * w_rho_alpha_mean + (1 - aggregation_weight) * old_w_rho_alpha))
+                    self.sesses[i].run(self.w_rho_beta.assign(aggregation_weight * w_rho_beta_mean + (1 - aggregation_weight) * old_w_rho_beta))
+                    self.sesses[i].run(self.w_v.assign(aggregation_weight * w_v_mean + (1 - aggregation_weight) * old_w_v))
+                    
+                    self.sesses[i].run(self.b_3.assign(aggregation_weight * b_3_mean + (1 - aggregation_weight) * old_b_3))
+                    self.sesses[i].run(self.b_power_alpha.assign(aggregation_weight * b_power_alpha_mean + (1 - aggregation_weight) * old_b_power_alpha))
+                    self.sesses[i].run(self.b_power_beta.assign(aggregation_weight * b_power_beta_mean + (1 - aggregation_weight) * old_b_power_beta))
+                    self.sesses[i].run(self.b_RB.assign(aggregation_weight * b_RB_mean + (1 - aggregation_weight) * old_b_RB))
+                    self.sesses[i].run(self.b_rho_alpha.assign(aggregation_weight * b_rho_alpha_mean + (1 - aggregation_weight) * old_b_rho_alpha))
+                    self.sesses[i].run(self.b_rho_beta.assign(aggregation_weight * b_rho_beta_mean + (1 - aggregation_weight) * old_b_rho_beta))
+                    self.sesses[i].run(self.b_v.assign(aggregation_weight * b_v_mean + (1 - aggregation_weight) * old_b_v))
             else:
                 # 硬替换（原有逻辑）：完全使用聚合参数
+                # 特征提取层 - 始终更新
                 self.sesses[i].run(self.w_1.assign(w_1_mean))
                 self.sesses[i].run(self.w_2.assign(w_2_mean))
-                self.sesses[i].run(self.w_3.assign(w_3_mean))
-                self.sesses[i].run(self.w_power_alpha.assign(w_power_alpha_mean))
-                self.sesses[i].run(self.w_power_beta.assign(w_power_beta_mean))
-                self.sesses[i].run(self.w_RB.assign(w_RB_mean))
-                self.sesses[i].run(self.w_rho_alpha.assign(w_rho_alpha_mean))
-                self.sesses[i].run(self.w_rho_beta.assign(w_rho_beta_mean))
-                self.sesses[i].run(self.w_v.assign(w_v_mean))
-                
                 self.sesses[i].run(self.b_1.assign(b_1_mean))
                 self.sesses[i].run(self.b_2.assign(b_2_mean))
-                self.sesses[i].run(self.b_3.assign(b_3_mean))
-                self.sesses[i].run(self.b_power_alpha.assign(b_power_alpha_mean))
-                self.sesses[i].run(self.b_power_beta.assign(b_power_beta_mean))
-                self.sesses[i].run(self.b_RB.assign(b_RB_mean))
-                self.sesses[i].run(self.b_rho_alpha.assign(b_rho_alpha_mean))
-                self.sesses[i].run(self.b_rho_beta.assign(b_rho_beta_mean))
-                self.sesses[i].run(self.b_v.assign(b_v_mean))
+                
+                # 决策层 - 只有在非分层模式下才更新
+                if not layer_wise:
+                    self.sesses[i].run(self.w_3.assign(w_3_mean))
+                    self.sesses[i].run(self.w_power_alpha.assign(w_power_alpha_mean))
+                    self.sesses[i].run(self.w_power_beta.assign(w_power_beta_mean))
+                    self.sesses[i].run(self.w_RB.assign(w_RB_mean))
+                    self.sesses[i].run(self.w_rho_alpha.assign(w_rho_alpha_mean))
+                    self.sesses[i].run(self.w_rho_beta.assign(w_rho_beta_mean))
+                    self.sesses[i].run(self.w_v.assign(w_v_mean))
+                    
+                    self.sesses[i].run(self.b_3.assign(b_3_mean))
+                    self.sesses[i].run(self.b_power_alpha.assign(b_power_alpha_mean))
+                    self.sesses[i].run(self.b_power_beta.assign(b_power_beta_mean))
+                    self.sesses[i].run(self.b_RB.assign(b_RB_mean))
+                    self.sesses[i].run(self.b_rho_alpha.assign(b_rho_alpha_mean))
+                    self.sesses[i].run(self.b_rho_beta.assign(b_rho_beta_mean))
+                    self.sesses[i].run(self.b_v.assign(b_v_mean))

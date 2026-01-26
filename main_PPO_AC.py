@@ -32,6 +32,9 @@ IS_FL = args.Do_FL
 IS_FL_adaptive = args.fl_adaptive_interval  # 自适应聚合频率开关
 IS_FL_soft = args.fl_soft_aggregation  # 软聚合开关
 FL_aggregation_weight = args.fl_aggregation_weight  # 软聚合权重（仅在软聚合启用时使用）
+IS_FL_layer_wise = args.fl_layer_wise  # 分层联邦聚合开关
+IS_FL_semantic_weighting = args.fl_semantic_weighting  # 语义感知加权开关
+FL_semantic_temperature = args.fl_semantic_temperature  # 语义加权温度系数
 n_veh = args.n_veh
 n_RB = args.n_RB
 
@@ -329,6 +332,15 @@ if IS_FL:
         weight_str = f"S{int(FL_aggregation_weight * 100):02d}"
         fl_config_parts.append(weight_str)
     
+    # 添加分层聚合标识
+    if IS_FL_layer_wise:
+        fl_config_parts.append("Layer")
+    
+    # 添加语义感知加权标识
+    if IS_FL_semantic_weighting:
+        temp_str = f"Sem{int(FL_semantic_temperature * 100):02d}"
+        fl_config_parts.append(temp_str)
+    
     log_name_parts.append("_".join(fl_config_parts))
 log_name = "_".join(log_name_parts)
 
@@ -451,18 +463,37 @@ for episode_idx in range(n_episode):
         should_aggregate = (i_episode % aggregation_interval == aggregation_interval - 1) and (i_episode < 0.9 * n_episode)
         
         if should_aggregate:
+            # 计算聚合权重
+            external_weights = None
+            if IS_FL_semantic_weighting:
+                # 1. 提取本轮次各 UAV 的平均语义能效 (Semantic EE)
+                # trans_all_user[0] 是 state_alls, shape=[Steps, n_veh, state_dim]
+                # semantic_EE_norm 是状态向量中倒数第4个元素 (index -4)
+                states_history = trans_all_user[0]  # Shape: [Steps, n_veh, state_dim]
+                
+                # 计算每个 Agent 在本局的平均 Semantic EE
+                avg_see_per_agent = np.mean(states_history[:, :, -4], axis=0)  # Shape: [n_veh]
+                
+                # 2. 计算语义权重 (Semantic Weights) - 使用 Softmax 放大优势
+                # 温度系数 T: 越小，好用户权重越大；越大，权重越平均
+                T = FL_semantic_temperature
+                exp_see = np.exp((avg_see_per_agent - np.max(avg_see_per_agent)) / T)
+                external_weights = exp_see / np.sum(exp_see)
+                
+                print(f"🧠 语义感知加权: Avg SEE={np.round(avg_see_per_agent, 3)}, Weights={np.round(external_weights, 3)}")
+            
             if IS_FL_adaptive:
                 print(f'Model averaged (stage: {stage}, interval: {aggregation_interval}) ' + '%d' % current_fed_times)
             else:
                 print('Model averaged ' + '%d' % current_fed_times)
             current_fed_times = current_fed_times + 1
             
-            # 传递软聚合参数
+            # 传递语义感知权重和软聚合参数
             if IS_FL_soft:
-                ppoes.averaging_model(success_rate, aggregation_weight=FL_aggregation_weight)
+                ppoes.averaging_model(success_rate, aggregation_weight=FL_aggregation_weight, layer_wise=IS_FL_layer_wise, external_weights=external_weights)
             else:
                 # 原有逻辑：硬替换（aggregation_weight=1.0）
-                ppoes.averaging_model(success_rate, aggregation_weight=1.0)
+                ppoes.averaging_model(success_rate, aggregation_weight=1.0, layer_wise=IS_FL_layer_wise, external_weights=external_weights)
 
 label_base = '%d_' %target_average_step+ '%d_' %n_veh + '%d_' %n_episode + '%s_' %args.lr_main + '%s_' %args.sigma_add + '%s_' %env_label
 if IS_meta:
