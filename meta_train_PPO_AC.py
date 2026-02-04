@@ -124,9 +124,9 @@ T_TIMESTEPS = int(env.time_slow / (env.time_fast))
 state_dim = len(get_state(env=env))
 action_dim = 3  # RB_choice + power + rho (compression ratio)
 action_bound = []
-action_bound.append(n_RB)  # RB bound
-action_bound.append(args.RB_action_bound)  # Power bound
-# 注意：rho使用Beta分布，范围固定为[0,1]，不需要action_bound
+action_bound.append(n_RB)
+action_bound.append(args.RB_action_bound)
+action_bound.append(1.0)  # rho bound [-1,1]，与 PPO 一致
 
 ppo = PPO(state_dim, action_bound, args.weight_for_L_vf, args.weight_for_entropy, args.epsilon, args.lr_meta_a, args.lr_meta_c, args.minibatch_steps, n_RB, sess)
 
@@ -167,16 +167,12 @@ def simulate():
                 action_all.append(action)
 
                 channel_action = action[0]
-                amp = envs[k].cellular_power_dB_List[0] / (2 * action_bound[1])
-                power_action = (action[1] + action_bound[1]) * amp
-                # 压缩比rho：从action的第3维获取（PPO网络已输出）
-                rho_action = action[2]  # 已经是[0,1]范围内的值（Beta分布输出）
-                # 确保rho在[0, 1]范围内（双重保险）
-                rho_action = np.clip(rho_action, 0.0, 1.0)
-                
+                max_power_dB = envs[k].cellular_power_dB_List[0]
+                power_01 = (float(action[1]) + 1.0) * 0.5
+                rho_01 = (float(action[2]) + 1.0) * 0.5
                 action_all_training[i, 0] = channel_action
-                action_all_training[i, 1] = power_action
-                action_all_training[i, 2] = rho_action
+                action_all_training[i, 1] = power_01 * max_power_dB
+                action_all_training[i, 2] = rho_01
                 
                 v_pred_all.append(v_pred)
             action_temp = action_all_training.copy()

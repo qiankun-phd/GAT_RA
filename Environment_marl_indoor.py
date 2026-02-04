@@ -145,8 +145,8 @@ class UAV:
         
         # Initialize velocity for Gauss-Markov model
         if start_velocity is None:
-            self.velocity = np.array([np.random.uniform(-5, 5), 
-                                     np.random.uniform(-5, 5), 
+            self.velocity = np.array([np.random.uniform(-2, 2), 
+                                     np.random.uniform(-2, 2), 
                                      np.random.uniform(-2, 2)], dtype=np.float32)
         else:
             self.velocity = np.array(start_velocity, dtype=np.float32)
@@ -190,9 +190,11 @@ Vehicle = UAV
 
 class Environ:
     def __init__(self, n_veh, n_RB, beta=0.5, circuit_power=0.06, optimization_target='SE_EE',
-                 area_size=25.0, height_min=1.5, height_max=1.5, comm_range=500.0,
+                 area_size=30.0, height_min=1.5, height_max=1.5, comm_range=500.0,
                  semantic_A_max=1.0, semantic_beta=2.0,
-                 semantic_A1=1.0, semantic_A2=0.2, semantic_C1=5.0, semantic_C2=2.0):
+                 semantic_A1=1.0, semantic_A2=0.2, semantic_C1=5.0, semantic_C2=2.0,
+                 task_sim_A_peak=0.5336, task_sim_xi=10.0, task_sim_zeta=0.2465,
+                 task_sim_gamma0=0.0, task_sim_b=0.5):
         """
         Initialize environment for UAV network
         Args:
@@ -268,12 +270,19 @@ class Environ:
         self.semantic_A_max = semantic_A_max  # Maximum semantic accuracy (mAP) - deprecated, use A1 instead
         self.semantic_beta = semantic_beta  # Compression ratio sensitivity parameter
         
-        # Sigmoid model parameters for semantic accuracy
-        # Formula: epsilon(gamma) = (A1 - A2) / (1 + exp(-(C1*gamma + C2))) + A2
-        self.semantic_A1 = semantic_A1  # Upper bound of accuracy (typically ≈ 1.0)
-        self.semantic_A2 = semantic_A2  # Lower bound of accuracy (typically 0.0-0.2)
-        self.semantic_C1 = semantic_C1  # Slope parameter (controls sensitivity to SINR)
-        self.semantic_C2 = semantic_C2  # Offset parameter (controls curve center)
+        # Sigmoid model parameters for semantic accuracy (legacy, kept for compatibility)
+        self.semantic_A1 = semantic_A1
+        self.semantic_A2 = semantic_A2
+        self.semantic_C1 = semantic_C1
+        self.semantic_C2 = semantic_C2
+
+        # Task similarity model: Q = A_peak * (1 - e^{-xi*rho}) / (1 + e^{-zeta*(gamma-gamma0)}) + b
+        # Fitted parameters (used in compute_semantic_accuracy / compute_semantic_similarity)
+        self.task_sim_A_peak = task_sim_A_peak
+        self.task_sim_xi = task_sim_xi
+        self.task_sim_zeta = task_sim_zeta
+        self.task_sim_gamma0 = task_sim_gamma0
+        self.task_sim_b = task_sim_b
 
     def add_new_vehicles(self, start_position, start_velocity=None):
         """
@@ -528,54 +537,42 @@ class Environ:
 
     def compute_semantic_accuracy(self, rho, sinr):
         """
-        Compute semantic accuracy (mAP) based on compression ratio and SINR
-        Using Sigmoid model from paper: epsilon(gamma) = (A1 - A2) / (1 + exp(-(C1*gamma + C2))) + A2
-        
-        Combined with compression ratio: accuracy = compression_term * sigmoid_term
-        
+        Compute task similarity (semantic accuracy) Q from fitted model:
+        Q = A_peak * (1 - exp(-xi*rho)) / (1 + exp(-zeta*(gamma - gamma0))) + b
+        Fitted parameters: A_peak=0.5336, xi=10, zeta=0.2465, gamma0=0, b=0.5
+
         Args:
             rho: Compression ratio [0, 1]
-            sinr: Signal-to-Interference-plus-Noise Ratio (linear scale)
-        
+            sinr: Signal-to-Interference-plus-Noise Ratio (gamma, linear scale)
+
         Returns:
-            accuracy: Semantic accuracy (mAP) in [A2, A1]
+            Q: Task similarity in [b, A_peak + b]
         """
-        # Ensure rho is in [0, 1]
         rho = np.clip(rho, 0.0, 1.0)
-        
-        # Compression ratio term: (1 - exp(-beta * rho))
-        # This captures the effect of compression on accuracy
-        compression_term = 1.0 - np.exp(-self.semantic_beta * rho)
-        
-        # SINR term: Sigmoid model from paper
-        # epsilon(gamma) = (A1 - A2) / (1 + exp(-(C1*gamma + C2))) + A2
-        # This captures the effect of channel quality (SINR) on accuracy
-        sigmoid_term = (self.semantic_A1 - self.semantic_A2) / (1.0 + np.exp(-(self.semantic_C1 * sinr + self.semantic_C2))) + self.semantic_A2
-        sigmoid_term = np.clip(sigmoid_term, self.semantic_A2, self.semantic_A1)
-        
-        # Combined accuracy: compression and SINR effects are multiplicative
-        # Both high compression ratio and high SINR are needed for high accuracy
-        accuracy = compression_term * sigmoid_term
-        
-        return accuracy
+        gamma = float(sinr)
+        num = 1.0 - np.exp(-self.task_sim_xi * rho)
+        den = 1.0 + np.exp(-self.task_sim_zeta * (gamma - self.task_sim_gamma0))
+        den = np.clip(den, 1e-8, None)  # avoid division by zero
+        Q = self.task_sim_A_peak * (num / den) + self.task_sim_b
+        Q = np.clip(Q, self.task_sim_b, self.task_sim_A_peak + self.task_sim_b)
+        return Q
     
     def compute_semantic_similarity(self, sinr):
         """
-        Compute semantic similarity epsilon(gamma) using Sigmoid model
-        This is the SINR-dependent term without compression ratio effect
-        Used for semantic rate calculation: R^s = W * (L/K) * epsilon(gamma)
-        
-        Formula: epsilon(gamma) = (A1 - A2) / (1 + exp(-(C1*gamma + C2))) + A2
-        
+        Compute gamma-dependent factor for task similarity model:
+        epsilon(gamma) = 1 / (1 + exp(-zeta*(gamma - gamma0)))
+        Same denominator as in Q = A_peak*(1-e^{-xi*rho})/(1+e^{-zeta*(gamma-gamma0)}) + b.
+        Used for semantic rate R^s = W * (L/K) * epsilon(gamma) and threshold checks.
+
         Args:
-            sinr: Signal-to-Interference-plus-Noise Ratio (linear scale)
-        
+            sinr: Signal-to-Interference-plus-Noise Ratio (gamma, linear scale)
+
         Returns:
-            epsilon: Semantic similarity in [A2, A1]
+            epsilon: Value in (0, 1]
         """
-        # Sigmoid model from paper
-        epsilon = (self.semantic_A1 - self.semantic_A2) / (1.0 + np.exp(-(self.semantic_C1 * sinr + self.semantic_C2))) + self.semantic_A2
-        epsilon = np.clip(epsilon, self.semantic_A2, self.semantic_A1)
+        gamma = float(sinr)
+        epsilon = 1.0 / (1.0 + np.exp(-self.task_sim_zeta * (gamma - self.task_sim_gamma0)))
+        epsilon = np.clip(epsilon, 1e-8, 1.0)
         return epsilon
 
     def Compute_Performance_Reward_Train(self, actions_all, IS_PPO):
@@ -1020,7 +1017,7 @@ class Environ:
         if n_Veh > 0:
             self.n_Veh = n_Veh
         self.add_new_vehicles_by_number(self.n_Veh)
-        self.renew_neighbor()
+        # self.renew_neighbor()  # 暂不计算邻居/邻接，省算力；启用 GAT 时再恢复
         self.renew_BS_channel()
         self.renew_BS_channels_fastfading()
 
