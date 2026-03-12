@@ -18,100 +18,71 @@ class A2GChannels:
     Uses probabilistic LoS model with Rician fading (LoS) and Rayleigh fading (NLoS)
     """
 
-    def __init__(self):
+    def __init__(self, path_loss_model='A2G'):
         # Ground Base Station (GBS) position [x, y, z] in meters
-        self.GBS_position = np.array([[12.5, 12.5, 0]])  # Ground level base station
+        self.GBS_position = np.array([[50, 50, 0]])  # Ground level base station
         self.fc = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6]  # Carrier frequencies in GHz
+        self.path_loss_model = path_loss_model  # 'A2G' or '3GPP_UMa'
         
-        # A2G channel parameters
-        self.eta_LoS = 1.0  # Additional path loss for LoS (dB)
-        self.eta_NLoS = 20.0  # Additional path loss for NLoS (dB)
+        # A2G channel parameters (standard ITU/3GPP A2G values)
+        self.eta_LoS = 0.0   # Additional path loss for LoS (dB)
+        self.eta_NLoS = 7.0  # Additional path loss for NLoS (dB)
         self.c = 3e8  # Speed of light (m/s)
         
         # Rician fading parameters for LoS
         self.K_rician = 10.0  # Rician K-factor (dB) for LoS links
         
-        # Environment parameters for LoS probability
-        self.a = 9.61  # Environment-dependent parameter
-        self.b = 0.16  # Environment-dependent parameter
-        self.alpha = 0.0  # Environment-dependent parameter (urban: 0.0, suburban: 0.5)
+        # Environment parameters for LoS probability (psi_a, psi_b in paper)
+        self.a = 9.61  # psi_a: environment-dependent
+        self.b = 0.16  # psi_b: environment-dependent
         
     def get_los_probability(self, uav_position):
         """
-        Calculate LoS probability using probabilistic model
-        Args:
-            uav_position: [x, y, z] position of UAV
-        Returns:
-            LoS probability
+        LoS probability P_LoS(θ) = 1/(1 + ψ_a exp(-ψ_b(θ - ψ_a))).
+        Paper: θ_i = arcsin((z_i - H_BS)/d_i) with d_i = 3D distance (radians then convert to degrees).
         """
-        # Calculate horizontal and vertical distances
         gbs_pos = self.GBS_position[0]
-        d_2d = math.sqrt((uav_position[0] - gbs_pos[0])**2 + (uav_position[1] - gbs_pos[1])**2)
+        d_3d = math.sqrt((uav_position[0] - gbs_pos[0])**2 +
+                        (uav_position[1] - gbs_pos[1])**2 +
+                        (uav_position[2] - gbs_pos[2])**2)
+        d_3d = max(d_3d, 1e-6)
         h_uav = uav_position[2]
         h_gbs = gbs_pos[2]
         
-        # Elevation angle in radians
-        if d_2d > 0:
-            theta = math.atan((h_uav - h_gbs) / d_2d) * 180 / math.pi  # Convert to degrees
-        else:
-            theta = 90.0
+        # Paper: theta = arcsin((z_i - H_BS) / d_i), then degrees for sigmoid
+        sin_theta = (h_uav - h_gbs) / d_3d
+        sin_theta = np.clip(sin_theta, -1.0, 1.0)
+        theta_rad = math.asin(sin_theta)
+        theta = theta_rad * 180.0 / math.pi  # degrees
         
-        # LoS probability model
         p_los = 1.0 / (1.0 + self.a * np.exp(-self.b * (theta - self.a)))
         return p_los
     
-    def get_path_loss(self, uav_position):
+    def get_path_loss(self, uav_position, is_los=True):
         """
-        Calculate path loss using A2G probabilistic model
-        Adjusted to match original BSchannels path loss for similar SINR levels
-        Args:
-            uav_position: [x, y, z] position of UAV
-        Returns:
-            path_loss: [n_GBS, n_RB] array of path loss in dB
+        Path loss in dB.
+        Models:
+          - A2G (default): PL = 32.4 + 20*log10(fc) + 31.9*log10(d_3d) + eta
+          - 3GPP_UMa: PL = 128.1 + 37.6*log10(d_3d/1000), d_3d in m
         """
         path_loss = np.zeros((len(self.GBS_position), len(self.fc)))
         gbs_pos = self.GBS_position[0]
-        
-        # Calculate 3D distance
-        d_3d = math.sqrt((uav_position[0] - gbs_pos[0])**2 + 
-                        (uav_position[1] - gbs_pos[1])**2 + 
+        d_3d = math.sqrt((uav_position[0] - gbs_pos[0])**2 +
+                        (uav_position[1] - gbs_pos[1])**2 +
                         (uav_position[2] - gbs_pos[2])**2)
-        
-        # Use original BSchannels formula for compatibility
-        # PL = 32.4 + 20*log10(fc) + 31.9*log10(d_3d)
-        # This matches the original environment's path loss model
-        for k in range(len(self.fc)):
-            path_loss[0, k] = 32.4 + 20 * np.log10(self.fc[k]) + 31.9 * np.log10(d_3d)
-        
+        d_3d = max(d_3d, 0.1)
+
+        if self.path_loss_model == '3GPP_UMa':
+            # 3GPP Urban Macro: PL = 128.1 + 37.6*log10(d_3d/1000), d_3d in m
+            pl_dB = 128.1 + 37.6 * np.log10(d_3d / 1000.0)
+            path_loss[:] = pl_dB
+        else:
+            # A2G (ITU): PL = 32.4 + 20*log10(fc) + 31.9*log10(d_3d) + eta
+            eta_extra = self.eta_LoS if is_los else self.eta_NLoS
+            for k in range(len(self.fc)):
+                path_loss[0, k] = 32.4 + 20 * np.log10(self.fc[k]) + 31.9 * np.log10(d_3d) + eta_extra
         return path_loss
 
-    def get_fast_fading(self, uav_position, is_los):
-        """
-        Generate fast fading component
-        Args:
-            uav_position: [x, y, z] position of UAV
-            is_los: boolean, whether link is LoS
-        Returns:
-            fading_gain: fading gain in dB
-        """
-        if is_los:
-            # Rician fading for LoS
-            # Convert K from dB to linear
-            K_linear = 10 ** (self.K_rician / 10)
-            # Rician distribution: sqrt(K/(K+1)) * direct + sqrt(1/(K+1)) * scattered
-            direct_component = np.sqrt(K_linear / (K_linear + 1))
-            scattered_real = np.random.normal(0, 1) / np.sqrt(2)
-            scattered_imag = np.random.normal(0, 1) / np.sqrt(2)
-            scattered_component = np.sqrt(1 / (K_linear + 1)) * (scattered_real + 1j * scattered_imag)
-            h_rician = direct_component + scattered_component
-            fading_gain = 20 * np.log10(np.abs(h_rician))
-        else:
-            # Rayleigh fading for NLoS
-            h_rayleigh = (np.random.normal(0, 1) + 1j * np.random.normal(0, 1)) / np.sqrt(2)
-            fading_gain = 20 * np.log10(np.abs(h_rayleigh))
-        
-        return fading_gain
-    
     def get_shadowing(self, delta_distance, shadowing):
         """
         Update shadowing with spatial correlation
@@ -132,7 +103,7 @@ class UAV:
     Supports 3D coordinates and Gauss-Markov mobility model
     """
 
-    def __init__(self, start_position, start_velocity=None, alpha=0.8, sigma_v=2.0):
+    def __init__(self, start_position, start_velocity=None, alpha=0.8, sigma_v=0.3):
         """
         Initialize UAV
         Args:
@@ -145,9 +116,9 @@ class UAV:
         
         # Initialize velocity for Gauss-Markov model
         if start_velocity is None:
-            self.velocity = np.array([np.random.uniform(-2, 2), 
-                                     np.random.uniform(-2, 2), 
-                                     np.random.uniform(-2, 2)], dtype=np.float32)
+            self.velocity = np.array([np.random.uniform(-1, 1), 
+                                     np.random.uniform(-1, 1), 
+                                     np.random.uniform(-1, 1)], dtype=np.float32)
         else:
             self.velocity = np.array(start_velocity, dtype=np.float32)
         
@@ -166,22 +137,22 @@ class UAV:
         Args:
             dt: time step in seconds
         """
-        # Update velocity using Gauss-Markov model
+        # Gauss-Markov velocity update:
         # v(t+1) = alpha * v(t) + (1-alpha) * v_mean + sqrt(1-alpha^2) * w(t)
-        w = np.random.normal(0, self.sigma_v, size=3)
-        self.velocity = (self.alpha * self.velocity + 
-                        (1 - self.alpha) * self.mean_velocity + 
-                        np.sqrt(1 - self.alpha**2) * w)
-        
-        # Update position
-        self.position = self.position + self.velocity * dt
-        
+        w = np.random.normal(0, self.sigma_v, size=3).astype(np.float32)
+        self.velocity = (self.alpha * self.velocity +
+                         (1 - self.alpha) * self.mean_velocity +
+                         np.sqrt(1 - self.alpha ** 2) * w)
+
         # Keep velocity within reasonable bounds for UAVs
-        max_horizontal_velocity = 20.0  # m/s
-        max_vertical_velocity = 5.0  # m/s
+        max_horizontal_velocity = 3.0   # m/s
+        max_vertical_velocity   = 1.0   # m/s
         self.velocity[0] = np.clip(self.velocity[0], -max_horizontal_velocity, max_horizontal_velocity)
         self.velocity[1] = np.clip(self.velocity[1], -max_horizontal_velocity, max_horizontal_velocity)
-        self.velocity[2] = np.clip(self.velocity[2], -max_vertical_velocity, max_vertical_velocity)
+        self.velocity[2] = np.clip(self.velocity[2], -max_vertical_velocity,   max_vertical_velocity)
+
+        # Update position
+        self.position = self.position + self.velocity * dt
 
 
 # Keep Vehicle as alias for backward compatibility (deprecated)
@@ -189,12 +160,15 @@ Vehicle = UAV
 
 
 class Environ:
+    # SINR success threshold: 3.16 dB -> linear ~2.07
+    SINR_THRESHOLD_DB = 3.16
+    SINR_THRESHOLD_LINEAR = 10 ** (SINR_THRESHOLD_DB / 10)
+
     def __init__(self, n_veh, n_RB, beta=0.5, circuit_power=0.06, optimization_target='SE_EE',
-                 area_size=30.0, height_min=1.5, height_max=1.5, comm_range=500.0,
-                 semantic_A_max=1.0, semantic_beta=2.0,
-                 semantic_A1=1.0, semantic_A2=0.2, semantic_C1=5.0, semantic_C2=2.0,
-                 task_sim_A_peak=0.5336, task_sim_xi=10.0, task_sim_zeta=0.2465,
-                 task_sim_gamma0=0.0, task_sim_b=0.5):
+                 area_size=100.0, height_min=20, height_max=25, comm_range=500.0,
+                 task_sim_A_peak=0.7128, task_sim_xi=10.0, task_sim_zeta=0.2313,
+                 task_sim_gamma0=0.0, task_sim_b=0.3249, sig2_dB=None, path_loss_offset_dB=0,
+                 path_loss_model='A2G'):
         """
         Initialize environment for UAV network
         Args:
@@ -207,11 +181,14 @@ class Environ:
             height_min: Minimum UAV height in meters (default: 50m)
             height_max: Maximum UAV height in meters (default: 200m)
             comm_range: Communication range threshold for graph construction in meters (default: 500m)
-            semantic_A_max: Maximum semantic accuracy (mAP) (default: 1.0)
-            semantic_beta: Compression ratio sensitivity parameter (default: 2.0)
             collision_penalty: Penalty for RB collision (default: -0.5)
             low_accuracy_penalty: Penalty for low accuracy (default: -0.3)
             accuracy_threshold: Minimum acceptable accuracy threshold (default: 0.5)
+            sig2_dB: Noise power spectral density in dB (default: -160). Use about -60 to -65
+                     so that SINR falls roughly in -10~20 dB with current path loss.
+            path_loss_offset_dB: Offset subtracted from path loss (default: 0). Use 50~55 to raise
+                     min SNR from ~-70 dB to >= -20 dB for area_size=500.
+            path_loss_model: 'A2G' (default, ITU) or '3GPP_UMa' (PL=128.1+37.6*log10(d_3d/1000)).
         """
         # Area dimensions (3D space for UAVs)
         self.width = area_size
@@ -224,30 +201,30 @@ class Environ:
         self.comm_range = comm_range
 
         # Channel model: A2G instead of BSchannels
-        self.A2GChannels = A2GChannels()
+        self.A2GChannels = A2GChannels(path_loss_model=path_loss_model)
+        # GBS 置于区域中心，与 area_size 一致（如 500×500 则 (250,250,0)）
+        self.A2GChannels.GBS_position = np.array([[area_size / 2.0, area_size / 2.0, 0.0]])
         self.vehicles = []  # List of UAVs (keeping name for compatibility)
 
-        self.demand = []
         self.cellular_Shadowing = []
         self.delta_distance = []
         self.cellular_channels_abs = []
-        self.los_status = []  # LoS/NLoS status for each UAV
 
-        self.cellular_power_dB_List = [24, 21, 18, 15, 12, 9, 6, 3, 0]   # the power levels
-        self.sig2_dB = -160
-        self.bsAntGain = 8
+        self.cellular_power_dB_List = [27, 21, 18, 15, 12, 9, 6, 3, 0]   # the power levels
+        self.sig2_dB = -160 if sig2_dB is None else float(sig2_dB)
+        self.path_loss_offset_dB = float(path_loss_offset_dB)
+        self.bsAntGain = 10
         self.bsNoiseFigure = 5
-        self.uavAntGain = 3  # Renamed from vehAntGain
-        self.vehAntGain = 3  # Keep for backward compatibility
+        self.uavAntGain = 3
         self.uavNoiseFigure = 9
-        self.vehNoiseFigure = 9  # Keep for backward compatibility
 
         self.n_RB = n_RB
         self.n_Veh = n_veh
 
         self.time_fast = 0.001
         self.time_slow = 0.1  # update slow fading/UAV position every 100 ms
-        self.BW = [0.18, 0.18, 0.36, 0.36, 0.36, 0.72, 0.72, 0.72, 1.44, 1.44] # MHz
+        BW_base = [0.18, 0.18, 0.36, 0.36, 0.36, 0.72, 0.72, 0.72, 1.44, 1.44]  # MHz, 10 RBs
+        self.BW = [BW_base[i % len(BW_base)] for i in range(n_RB)]  # 支持 n_RB != 10
         self.channel_choice = np.zeros([self.n_RB])
         self.success = np.zeros([self.n_Veh])
         self.similarity_success = np.zeros([self.n_Veh])  # Track similarity threshold achievement
@@ -257,7 +234,6 @@ class Environ:
         self.semantic_accuracy = np.zeros(self.n_Veh)
         self.semantic_EE = np.zeros(self.n_Veh)
         self.semantic_Rate = np.zeros(self.n_Veh)
-        self.semantic_similarity = np.zeros(self.n_Veh)  # epsilon (semantic similarity)
         self.rho_current = np.zeros(self.n_Veh)  # Current compression ratio
         self.cellular_SINR = np.zeros(self.n_Veh)  # Store SINR for state
         
@@ -266,18 +242,10 @@ class Environ:
         self.beta = beta  # Deprecated, kept for backward compatibility (not used in reward calculation)
         self.circuit_power = circuit_power  # Circuit power in linear scale
 
-        # Semantic Communication parameters
-        self.semantic_A_max = semantic_A_max  # Maximum semantic accuracy (mAP) - deprecated, use A1 instead
-        self.semantic_beta = semantic_beta  # Compression ratio sensitivity parameter
-        
-        # Sigmoid model parameters for semantic accuracy (legacy, kept for compatibility)
-        self.semantic_A1 = semantic_A1
-        self.semantic_A2 = semantic_A2
-        self.semantic_C1 = semantic_C1
-        self.semantic_C2 = semantic_C2
-
+        # 图片语义熵 (semantic entropy of image)，计算 semantic rate 时乘以该因子
+        self.semantic_entropy_image = 3.22
         # Task similarity model: Q = A_peak * (1 - e^{-xi*rho}) / (1 + e^{-zeta*(gamma-gamma0)}) + b
-        # Fitted parameters (used in compute_semantic_accuracy / compute_semantic_similarity)
+        # Fitted parameters (used in compute_semantic_accuracy)
         self.task_sim_A_peak = task_sim_A_peak
         self.task_sim_xi = task_sim_xi
         self.task_sim_zeta = task_sim_zeta
@@ -344,103 +312,43 @@ class Environ:
             # Keep altitude within bounds
             uav.position[2] = np.clip(uav.position[2], self.height_min, self.height_max)
 
-
-    def renew_neighbor(self):
-        """
-        Determine the neighbors of each UAV based on communication range
-        Maintains interface compatibility with existing RL agent
-        """
-        for i in range(len(self.vehicles)):
-            self.vehicles[i].neighbors = []
-            self.vehicles[i].actions = []
-        
-        # Calculate pairwise 3D distances
-        n_uavs = len(self.vehicles)
-        positions = np.array([uav.position for uav in self.vehicles])
-        Distance = np.zeros((n_uavs, n_uavs))
-        
-        for i in range(n_uavs):
-            for j in range(n_uavs):
-                if i != j:
-                    Distance[i, j] = np.linalg.norm(positions[i] - positions[j])
-                else:
-                    Distance[i, j] = np.inf
-        
-        # Find neighbors within communication range
-        for i in range(len(self.vehicles)):
-            neighbors = np.where(Distance[i, :] <= self.comm_range)[0].tolist()
-            self.vehicles[i].neighbors = neighbors
-            self.vehicles[i].destinations = neighbors
-    
-    def get_adjacency_matrix(self, threshold=None):
-        """
-        Get adjacency matrix for graph structure based on distance thresholds
-        Args:
-            threshold: Distance threshold in meters (default: self.comm_range)
-        Returns:
-            adjacency_matrix: [n_uavs, n_uavs] binary adjacency matrix
-            edge_features: Optional edge features (distances) if needed
-        """
-        if threshold is None:
-            threshold = self.comm_range
-        
-        n_uavs = len(self.vehicles)
-        adjacency_matrix = np.zeros((n_uavs, n_uavs), dtype=np.float32)
-        positions = np.array([uav.position for uav in self.vehicles])
-        
-        # Calculate pairwise distances and build adjacency matrix
-        for i in range(n_uavs):
-            for j in range(n_uavs):
-                if i != j:
-                    distance = np.linalg.norm(positions[i] - positions[j])
-                    if distance <= threshold:
-                        adjacency_matrix[i, j] = 1.0
-        
-        return adjacency_matrix
-
     def renew_BS_channel(self):
         """
-        Renew slow fading channel using A2G model
-        Maintains interface compatibility with existing RL agent
+        Renew slow fading channel using A2G model.
+        Path loss uses the expected value over LoS/NLoS:
+          PL_expected = P_LoS * PL_LoS + (1 - P_LoS) * PL_NLoS
+        This avoids per-episode 19 dB jumps from random LoS/NLoS draws,
+        keeping the slow-fading channel stationary for RL training.
         """
         self.cellular_pathloss = np.zeros((len(self.vehicles), self.n_RB))
-        self.los_status = []  # Store LoS status for each UAV
 
         for i in range(len(self.vehicles)):
             # Update shadowing with spatial correlation
             self.cellular_Shadowing[i] = self.A2GChannels.get_shadowing(
                 self.delta_distance[i], self.cellular_Shadowing[i])
-            
-            # Get path loss using A2G model
-            pathloss = self.A2GChannels.get_path_loss(self.vehicles[i].position)[0]
-            self.cellular_pathloss[i] = pathloss
-            
-            # Determine LoS status (probabilistic)
-            p_los = self.A2GChannels.get_los_probability(self.vehicles[i].position)
-            is_los = np.random.random() < p_los
-            self.los_status.append(is_los)
-        
+
+            # Expected path loss
+            if self.A2GChannels.path_loss_model == '3GPP_UMa':
+                pathloss = self.A2GChannels.get_path_loss(self.vehicles[i].position)[0, 0]
+            else:
+                p_los = self.A2GChannels.get_los_probability(self.vehicles[i].position)
+                pl_los  = self.A2GChannels.get_path_loss(self.vehicles[i].position, is_los=True)[0]
+                pl_nlos = self.A2GChannels.get_path_loss(self.vehicles[i].position, is_los=False)[0]
+                pathloss = p_los * pl_los + (1.0 - p_los) * pl_nlos
+            self.cellular_pathloss[i] = pathloss - self.path_loss_offset_dB
+
         # Combine path loss and shadowing
-        self.cellular_channels_abs = (self.cellular_pathloss + 
-                                     np.repeat(self.cellular_Shadowing[:, np.newaxis], self.n_RB, axis=1))
+        self.cellular_channels_abs = (self.cellular_pathloss +
+                                      np.repeat(self.cellular_Shadowing[:, np.newaxis], self.n_RB, axis=1))
 
     def renew_BS_channels_fastfading(self):
         """
-        Renew fast fading channel using A2G model (Rician for LoS, Rayleigh for NLoS)
-        Maintains interface compatibility with existing RL agent
+        Renew fast fading channel: same as backup, superimpose Rayleigh fast fading (dB) on slow channel.
+        channel_with_fast = channel_abs - 20*log10(|h|), h ~ CN(0,1)/sqrt(2).
         """
-        cellular_channels_with_fastfading = self.cellular_channels_abs.copy()
-        
-        # Apply fast fading based on LoS status
-        for i in range(len(self.vehicles)):
-            is_los = self.los_status[i] if i < len(self.los_status) else True
-            fading_gain = self.A2GChannels.get_fast_fading(self.vehicles[i].position, is_los)
-            
-            # Apply fading to all RBs for this UAV
-            for k in range(self.n_RB):
-                cellular_channels_with_fastfading[i, k] += fading_gain
-        
-        self.cellular_channels_with_fastfading = cellular_channels_with_fastfading
+        shape = self.cellular_channels_abs.shape
+        h = (np.random.normal(0, 1, shape) + 1j * np.random.normal(0, 1, shape)) / math.sqrt(2)
+        self.cellular_channels_with_fastfading = self.cellular_channels_abs - 20 * np.log10(np.abs(h) + 1e-20)
 
     def Compute_Performance_Reward_Failure(self, actions_all=None, IS_PPO=False):
         """
@@ -466,9 +374,10 @@ class Environ:
                 rho = np.ones(len(self.vehicles)) * 0.5  # Default compression ratio
 
         transmit_power = np.zeros(len(self.vehicles))
-        # Use minimum power for failure case
+        # Use maximum power for failure case (index 0 = max power, e.g. 27 dBm)
+        max_power_dB = self.cellular_power_dB_List[0]
         for i in range(len(self.vehicles)):
-            transmit_power[i] = self.cellular_power_dB_List[0]
+            transmit_power[i] = max_power_dB
         
         # Compute basic metrics (similar to success case but with low power)
         channel_choice = np.zeros(self.n_RB)
@@ -480,7 +389,7 @@ class Environ:
             channel_choice[l] += 1
             cellular_Signals[i, l] = 10 ** ((transmit_power[i] -
                                             self.cellular_channels_with_fastfading[i, l] + 
-                                            self.vehAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
+                                            self.uavAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
 
         # Compute SINR (assuming interference)
         for i in range(len(self.vehicles)):
@@ -499,21 +408,18 @@ class Environ:
         for i in range(len(self.vehicles)):
             semantic_accuracy[i] = self.compute_semantic_accuracy(rho[i], cellular_SINR[i])
             
-            # Semantic Rate: S = W * (I/K) * L * epsilon(K,gamma)
-            # where I/K is semantic information density, modeled as I/K = rho
-            # L is a scaling factor (could be 1.0 or related to compression)
-            # For simplicity, we use: S = W * rho * epsilon(gamma)
+            # Semantic Rate: S = W * (I/K) * L * semantic_accuracy * H_image (图片语义熵 3.22)
             l = actions[i]
             W = self.BW[l]
-            LK = rho[i]  # I/K = rho (linear model), L factor absorbed
-            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
-            semantic_Rate[i] = W * LK * epsilon
-            semantic_SE[i] = LK * epsilon
+            LK = rho[i]  # I/K = rho (linear model)
+            H_img = self.semantic_entropy_image
+            semantic_Rate[i] = W * LK * semantic_accuracy[i] * H_img
+            semantic_SE[i] = LK * semantic_accuracy[i] * H_img
             
             # Semantic Energy Efficiency = Semantic Rate / (Transmission_Power + Circuit_Power)
             # SEE = S / (P_tx + P_circuit)
             total_power = transmission_power_linear[i] + self.circuit_power
-            if total_power > 0:
+            if total_power > 0 :
                 semantic_EE[i] = semantic_Rate[i] / total_power
             else:
                 semantic_EE[i] = 0.0
@@ -538,43 +444,27 @@ class Environ:
     def compute_semantic_accuracy(self, rho, sinr):
         """
         Compute task similarity (semantic accuracy) Q from fitted model:
-        Q = A_peak * (1 - exp(-xi*rho)) / (1 + exp(-zeta*(gamma - gamma0))) + b
-        Fitted parameters: A_peak=0.5336, xi=10, zeta=0.2465, gamma0=0, b=0.5
+        Q = A_peak * (1 - exp(-xi*rho)) / (1 + exp(-zeta*(gamma_dB - gamma0))) + b
+        Fitted parameters (SNR -20~60 dB): A_peak=0.7128, xi=10, zeta=0.2313, gamma0=0, b=0.3249
 
         Args:
             rho: Compression ratio [0, 1]
-            sinr: Signal-to-Interference-plus-Noise Ratio (gamma, linear scale)
+            sinr: SNR/SINR in linear scale (converted to dB internally)
 
         Returns:
             Q: Task similarity in [b, A_peak + b]
         """
         rho = np.clip(rho, 0.0, 1.0)
-        gamma = float(sinr)
+        # Convert linear SNR to dB for sigmoid (model parameters are fitted in dB domain)
+        sinr_linear = float(sinr)
+        gamma_dB = 10.0 * np.log10(max(sinr_linear, 1e-10))
         num = 1.0 - np.exp(-self.task_sim_xi * rho)
-        den = 1.0 + np.exp(-self.task_sim_zeta * (gamma - self.task_sim_gamma0))
-        den = np.clip(den, 1e-8, None)  # avoid division by zero
+        den = 1.0 + np.exp(-self.task_sim_zeta * (gamma_dB - self.task_sim_gamma0))
+        den = np.clip(den, 1e-8, None)
         Q = self.task_sim_A_peak * (num / den) + self.task_sim_b
         Q = np.clip(Q, self.task_sim_b, self.task_sim_A_peak + self.task_sim_b)
         return Q
     
-    def compute_semantic_similarity(self, sinr):
-        """
-        Compute gamma-dependent factor for task similarity model:
-        epsilon(gamma) = 1 / (1 + exp(-zeta*(gamma - gamma0)))
-        Same denominator as in Q = A_peak*(1-e^{-xi*rho})/(1+e^{-zeta*(gamma-gamma0)}) + b.
-        Used for semantic rate R^s = W * (L/K) * epsilon(gamma) and threshold checks.
-
-        Args:
-            sinr: Signal-to-Interference-plus-Noise Ratio (gamma, linear scale)
-
-        Returns:
-            epsilon: Value in (0, 1]
-        """
-        gamma = float(sinr)
-        epsilon = 1.0 / (1.0 + np.exp(-self.task_sim_zeta * (gamma - self.task_sim_gamma0)))
-        epsilon = np.clip(epsilon, 1e-8, 1.0)
-        return epsilon
-
     def Compute_Performance_Reward_Train(self, actions_all, IS_PPO):
         """
         Compute performance metrics for training with Semantic Communication
@@ -598,72 +488,56 @@ class Environ:
             actions = actions_all[:, 0].astype(int)
             rho = np.ones(len(self.vehicles)) * 0.8  # Default compression ratio
             if is_ppo_mode:
-                transmit_power = actions_all[:, 1]
+                transmit_power = actions_all[:, 1].astype(np.float32)
+                power_selection = None
             else:
                 power_selection = actions_all[:, 1].astype(int)
-                transmit_power = np.zeros(len(self.vehicles))
-                for i in range(len(self.vehicles)):
-                    transmit_power[i] = self.cellular_power_dB_List[power_selection[i]]
+                transmit_power = np.array([self.cellular_power_dB_List[int(p)] for p in power_selection], dtype=np.float32)
         else:
             # New format: [RB, Power, rho]
             actions = actions_all[:, 0].astype(int)
             rho = np.clip(actions_all[:, 2], 0.0, 1.0)  # Compression ratio [0, 1]
             if is_ppo_mode:
-                transmit_power = actions_all[:, 1]
+                transmit_power = actions_all[:, 1].astype(np.float32)
+                power_selection = None
             else:
                 power_selection = actions_all[:, 1].astype(int)
-                transmit_power = np.zeros(len(self.vehicles))
-                for i in range(len(self.vehicles)):
-                    transmit_power[i] = self.cellular_power_dB_List[power_selection[i]]
-            if is_ppo_mode:
-                transmit_power = actions_all[:, 1]
-            else:
-                power_selection = actions_all[:, 1].astype(int)
-            transmit_power = np.zeros(len(self.vehicles))
+                transmit_power = np.array([self.cellular_power_dB_List[int(p)] for p in power_selection], dtype=np.float32)
 
-        # ------------ Compute signal and interference --------------------
+        # ------------ Compute signal, interference and SINR (with collision penalty) --------------------
         channel_choice = np.zeros(self.n_RB)
+        cellular_Interference = np.zeros(self.n_RB)
         cellular_SINR = np.zeros(self.n_Veh)
         cellular_Signals = np.zeros([self.n_Veh, self.n_RB])
-        cellular_Interference = np.zeros([self.n_RB])  # Total interference per RB
-        
+
         for i in range(len(self.vehicles)):
             l = actions[i]
-            if not is_ppo_mode:
-                # 传统模式：需要从power_selection索引转换为dB值
-                transmit_power[i] = self.cellular_power_dB_List[power_selection[i]]
-            
-            # Count channel usage (for collision detection)
-            channel_choice[actions[i]] += 1
-            
+            channel_choice[l] += 1
+
             # Compute signal power (linear scale)
             signal_power_linear = 10 ** ((transmit_power[i] -
-                                         self.cellular_channels_with_fastfading[i, l] + 
-                                         self.vehAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
+                                         self.cellular_channels_with_fastfading[i, l] +
+                                         self.uavAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
             cellular_Signals[i, l] = signal_power_linear
-            
-            # Add to interference on this RB
             cellular_Interference[l] += signal_power_linear
-        
-        # Detect collisions (multiple UAVs on same RB)
+
+        # Collision: multiple UAVs on same RB
         collisions = np.zeros(self.n_Veh)
         for i in range(len(self.vehicles)):
             if channel_choice[actions[i]] > 1:
-                collisions[i] = 1  # Collision detected
-        
-        # Compute SINR (considering interference from other UAVs on same RB)
+                collisions[i] = 1
+
+        # SINR = signal / (interference from other UAVs on same RB + noise)
         for i in range(len(self.vehicles)):
             l = actions[i]
-            # Interference = total power on this RB - own signal + noise
             interference_total = cellular_Interference[l] - cellular_Signals[i, l] + self.sig2[l]
             cellular_SINR[i] = cellular_Signals[i, l] / interference_total
-        
-        # Success: no collision and SINR above threshold
+
+        # Success: no collision AND SINR above threshold
         self.success = np.zeros([self.n_Veh])
-        sinr_threshold_linear = 10 ** (3.16 / 10)  # 3.16 dB in linear scale
         for i in range(len(self.vehicles)):
-            if collisions[i] == 0 and cellular_SINR[i] > sinr_threshold_linear:
-                    self.success[i] = 1
+            if collisions[i] == 0 and cellular_SINR[i] > self.SINR_THRESHOLD_LINEAR:
+                self.success[i] = 1
         
         self.channel_choice = channel_choice
         
@@ -681,44 +555,21 @@ class Environ:
             # Compute semantic accuracy (mAP) based on compression ratio and SINR
             semantic_accuracy[i] = self.compute_semantic_accuracy(rho[i], cellular_SINR[i])
             
-            # Semantic Rate: R^s = W * (L/K) * epsilon(gamma)
-            # where L/K is semantic information density, modeled as L/K = rho
-            # epsilon(gamma) is semantic similarity (accuracy without compression term)
+            # Semantic Rate: R^s = W * (I/K) * L * semantic_accuracy * H_image (图片语义熵 3.22)
             l = actions[i]
             W = self.BW[l]  # Bandwidth in MHz
-
             IK = rho[i]  # I/K = rho (linear model)
-            L_factor = 1.0  # L scaling factor (can be adjusted if needed)
-            
-            # epsilon(gamma): semantic similarity (Sigmoid model)
-            # This depends on K (number of symbols) and gamma (SINR)
-            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
-            
-            # Semantic Rate: S = W * (I/K) * L * epsilon(K,gamma)
-            semantic_Rate[i] = W * IK * L_factor * epsilon
-            
-            # Semantic Spectral Efficiency: Semantic-SE = S / W = (I/K) * L * epsilon(K,gamma)
-            semantic_SE[i] = IK * L_factor * epsilon
-            
-            # Semantic Energy Efficiency = Semantic Rate / (Transmission_Power + Circuit_Power)
-            # SEE = S / (P_tx + P_circuit), where S = W * (I/K) * L * epsilon(K,gamma)
+            L_factor = 1.0
+            H_img = self.semantic_entropy_image
+            semantic_Rate[i] = W * IK * L_factor * semantic_accuracy[i] * H_img
+            semantic_SE[i] = IK * L_factor * semantic_accuracy[i] * H_img
             total_power = transmission_power_linear[i] + self.circuit_power
-            if total_power > 0:
-                semantic_EE[i] = semantic_Rate[i] / total_power
-            else:
-                semantic_EE[i] = 0.0
-        
-        # No additional penalties - failures handled by success flag and SINR threshold
-        semantic_EE_penalized = semantic_EE
-        
-        # Store semantic metrics for state representation (after all calculations are complete)
-        for i in range(len(self.vehicles)):
+            semantic_EE[i] = semantic_Rate[i] / total_power if total_power > 0 else 0.0
+            
+            # Store for state representation (state uses semantic_accuracy)
             self.semantic_accuracy[i] = semantic_accuracy[i]
             self.semantic_EE[i] = semantic_EE[i]
             self.semantic_Rate[i] = semantic_Rate[i]
-            # Compute semantic similarity for storage
-            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
-            self.semantic_similarity[i] = epsilon
             self.rho_current[i] = rho[i]
             self.cellular_SINR[i] = cellular_SINR[i]
         
@@ -734,7 +585,7 @@ class Environ:
             EE[i] = np.divide(cellular_Rate[i], power_linear + self.circuit_power)
 
         return (cellular_Rate, cellular_SINR, SE, EE, 
-                semantic_accuracy, semantic_EE_penalized, collisions,
+                semantic_accuracy, semantic_EE, collisions,
                 semantic_Rate, semantic_SE)
 
     def Compute_Performance_Reward_Test_rand(self, actions_all, IS_PPO):
@@ -749,8 +600,8 @@ class Environ:
 
         # ------------ Compute cellular rate --------------------
         channel_choice = np.zeros(self.n_RB)
-        cellular_Rate = np.zeros(self.n_RB)
-        SE = np.zeros(self.n_RB)
+        cellular_Rate = np.zeros(self.n_Veh)
+        SE = np.zeros(self.n_Veh)
         cellular_Signals = np.zeros([self.n_Veh, self.n_RB])
         cellular_Interference = np.zeros(self.n_RB)  # cellular interference index RB
         for i in range(len(self.vehicles)):
@@ -758,18 +609,18 @@ class Environ:
                 if IS_PPO:
                     cellular_Signals[i, l] = 10 ** ((transmit_power -
                                                self.cellular_channels_with_fastfading[
-                                                   i, l] + self.vehAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
+                                                   i, l] + self.uavAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
                 else:
                     cellular_Signals[i, l] = 10 ** ((self.cellular_power_dB_List[power_selection[i]] -
                                                self.cellular_channels_with_fastfading[
-                                                   i, l] + self.vehAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
+                                                   i, l] + self.uavAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
                 if IS_PPO:
                     if (l == actions):
                         channel_choice[actions] += 1
                         cellular_Interference[actions] += 10 ** ((transmit_power -
                                                                    self.cellular_channels_with_fastfading[
                                                                        i, actions]
-                                                                   + self.vehAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
+                                                                   + self.uavAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
                 else:
                     if (l == actions[i]):
                         channel_choice[actions[i]] += 1
@@ -777,7 +628,7 @@ class Environ:
                                                                        power_selection[i]] -
                                                                    self.cellular_channels_with_fastfading[
                                                                        i, actions[i]]
-                                                                   + self.vehAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
+                                                                   + self.uavAntGain + self.bsAntGain - self.bsNoiseFigure) / 10)
 
         self.success = np.zeros([self.n_Veh])
         for i in range(len(self.vehicles)):
@@ -792,7 +643,8 @@ class Environ:
                         if (actions[i] == l):
                             self.success[i] = 1
         self.channel_choice = channel_choice
-        self.cellular_Interference = cellular_Interference + self.sig2
+        # No inter-UAV interference: use noise only
+        self.cellular_Interference = self.sig2
         cellular_Rate_all = np.log2(1 + np.divide(cellular_Signals, self.sig2)) * self.BW
 
         for i in range(len(self.vehicles)):
@@ -841,7 +693,7 @@ class Environ:
                 - actions[:, 2]: semantic compression ratio rho [0, 1]
             IS_PPO: bool or int, whether using PPO/DDPG format
         Returns:
-            reward: Semantic Energy Efficiency sum (not average) for meta training
+            reward: Semantic Energy Efficiency average (per UAV) for meta training
         """
         action_temp = actions.copy()
         # 兼容处理：确保IS_PPO参数被正确处理
@@ -855,32 +707,20 @@ class Environ:
         
         # Get failure case metrics (low SINR scenario)
         failure_results = self.Compute_Performance_Reward_Failure(action_temp, is_ppo_mode)
-        (_, _, failure_SE, _, _, failure_semantic_EE, _, _, _) = failure_results
+        (_, _, _, _, _, failure_semantic_EE, _, _, _) = failure_results
         
-        # Use Semantic-EE as reward (only optimize SEE)
-        # 与act_for_training保持一致的处理逻辑
-        SE_sum = 0.0  # Not used in reward calculation (kept for potential future use)
         Semantic_EE_sum = 0.0
         
         # Initialize reward to avoid UnboundLocalError
         reward = 0.0
         
-        # Training semantic similarity threshold (instead of SINR threshold)
-        # 使用语义相似度门限，更符合语义通信的特点
-        training_similarity_threshold = 0.5  # 语义相似度门限 [A2, A1] = [0.2, 1.0]
+        # 使用 semantic_accuracy 门限
+        training_accuracy_threshold = 0.5  # semantic_accuracy 门限
         
-        # Three cases with different handling
         for i in range(len(self.success)):
-            # 计算语义相似度
-            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
-            
-            if (self.success[i] == 1) and (epsilon > training_similarity_threshold):
-                # Case 1: Success with good semantic similarity - use normal SE/EE
-                SE_sum += SE[i]
+            if (self.success[i] == 1) and (semantic_accuracy[i] > training_accuracy_threshold):
                 Semantic_EE_sum += semantic_EE[i]
             elif (self.success[i] == 1):
-                # Case 2: Success but similarity not high enough - use failure SE/EE (smaller values)
-                SE_sum += failure_SE[i]
                 Semantic_EE_sum += failure_semantic_EE[i]
             else:
                 # Case 3: Failure (collision) - apply penalty
@@ -890,10 +730,7 @@ class Environ:
             
             reward = Semantic_EE_sum
         
-        # Return sum (not average) for meta training
-        # 注意：meta训练返回sum，而普通训练返回average
-        # 如果需要缩放，可以在这里添加（但通常meta训练不需要，因为返回的是sum）
-        return reward
+        return reward / self.n_Veh
 
     def act_for_training(self, actions, IS_PPO):
         """
@@ -919,82 +756,47 @@ class Environ:
         
         # Get failure case metrics (low SINR scenario)
         failure_results = self.Compute_Performance_Reward_Failure(action_temp, is_ppo_mode)
-        (_, _, failure_SE, _, _, failure_semantic_EE, _, _, _) = failure_results
+        (_, _, _, _, _, failure_semantic_EE, _, _, _) = failure_results
         
         # Use Semantic-EE as reward (only optimize SEE)
-        SE_sum = 0.0  # Not used in reward calculation (kept for potential future use)
         Semantic_EE_sum = 0.0
         
-        # Training semantic similarity threshold (instead of SINR threshold)
-        # 使用语义相似度门限，更符合语义通信的特点
-        # 语义相似度范围: [A2, A1] = [0.2, 1.0]
-        # 门限0.5表示中等相似度，对应SINR约2.5 dB
-        training_similarity_threshold = 0.5  # 语义相似度门限
+        training_accuracy_threshold = 0.5  # semantic_accuracy 门限
         
-        # Initialize similarity_success for this step
         self.similarity_success = np.zeros([self.n_Veh])
-        
-        # Initialize reward to avoid UnboundLocalError
         reward = 0.0
         
-        # Simplified logic: two cases (Case 2 and Case 3 merged since they use same handling)
         for i in range(len(self.success)):
-            # 计算语义相似度
-            epsilon = self.compute_semantic_similarity(cellular_SINR[i])
-            
-            # Track similarity threshold achievement
-            if (self.success[i] == 1) and (epsilon > training_similarity_threshold):
-                self.similarity_success[i] = 1  # Both success and similarity threshold met
-            
-            if (self.success[i] == 1) and (epsilon > training_similarity_threshold):
-                # Case 1: Success with good semantic similarity - use normal SE/EE
-                SE_sum += SE[i]
+            if (self.success[i] == 1) and (semantic_accuracy[i] > training_accuracy_threshold):
+                self.similarity_success[i] = 1
                 Semantic_EE_sum += semantic_EE[i]
             elif (self.success[i] == 1):
-                # Case 2: Success but SINR not high enough - use failure SE/EE (smaller values)
-                SE_sum += failure_SE[i]
                 Semantic_EE_sum += failure_semantic_EE[i]
             else:
                 # Case 3: Failure (collision) - apply penalty
                 Semantic_EE_sum = (np.sum(self.success) - self.n_Veh) / self.n_Veh
-                reward = Semantic_EE_sum / self.n_Veh  # Set reward before break
                 break
 
-            reward = Semantic_EE_sum / self.n_Veh
+        reward = Semantic_EE_sum / self.n_Veh
         
         return reward
 
     def act_for_testing(self, actions, IS_PPO):
-
         action_temp = actions.copy()
         results = self.Compute_Performance_Reward_Train(action_temp, IS_PPO)
         cellular_Rate, cellular_SINR, SE, EE, _, _, _, _, _ = results
         for i in range(len(cellular_Rate)):
-            if (self.success[i] == 1) and (cellular_SINR [i] > 3.16):
-                SE[i] = SE[i]
-                EE[i] = EE[i]
-            else:
-                SE[i] = 0
-                EE[i] = 0
-
+            if not (self.success[i] == 1 and cellular_SINR[i] > self.SINR_THRESHOLD_LINEAR):
+                SE[i], EE[i] = 0.0, 0.0
         return SE, EE, cellular_Rate
 
     def act_for_testing_marl(self, actions, IS_PPO):
-        done = True
         action_temp = actions.copy()
         results = self.Compute_Performance_Reward_Train(action_temp, IS_PPO)
         cellular_Rate, cellular_SINR, SE, EE, _, _, _, _, _ = results
-        for i in range(len(cellular_Rate)):
-            if (self.success[i] == 1) and  (cellular_SINR [i] > 3.16):
-                SE[i] = SE[i]
-                EE[i] = EE[i]
-            else:
-                done = False
-                break
+        done = all(self.success[i] == 1 and cellular_SINR[i] > self.SINR_THRESHOLD_LINEAR for i in range(len(cellular_Rate)))
         if not done:
-            for i in range (len(SE)):
-                SE[i] = 0
-                EE[i] = 0
+            SE[:], EE[:] = 0.0, 0.0
         return SE, EE, cellular_Rate
 
     def act_for_testing_rand(self, actions, IS_PPO):

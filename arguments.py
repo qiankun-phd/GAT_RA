@@ -21,6 +21,11 @@ def get_args():
         default=2,
         help='set_random_seed')
     parser.add_argument(
+        '--use_different_seeds_per_agent',
+        action='store_true',
+        default=False,
+        help='use different random seeds for each agent to ensure parameter diversity (default: False, all agents use the same seed)')
+    parser.add_argument(
         '--meta_episode',
         type=int,
         default=100,
@@ -48,7 +53,7 @@ def get_args():
     parser.add_argument(
         '--n_veh_list',
         type=lambda s: [int(item) for item in s.strip('[]').split(',')],
-        default=[2, 4, 8],
+        default=[2,4,8],
         help='number of vehicles (for different tasks), e.g., [2,4,6,8,10] or 2,4,6,8,10')
     parser.add_argument(
         '--n_RB',
@@ -94,7 +99,7 @@ def get_args():
         '--epsilon',
         type=float,
         default=0.5,
-        help='ratio clip value (default 0.5)')
+        help='PPO clip ratio epsilon, clip range [1-eps, 1+eps] (default 0.5)')
     parser.add_argument(
         '--lr_meta_a', type=float, default=5e-7, help='learning rate for actor (default: 5e-7)')
     parser.add_argument(
@@ -102,19 +107,53 @@ def get_args():
     parser.add_argument(
         '--lr_main', type=float, default=1e-6, help='learning rate for PPO (default: 1e-6)')
     parser.add_argument(
+        '--lr_decay_after_ratio', type=float, default=0.0,
+        help='after this ratio of n_episode, lr linearly decays to lr_main*lr_decay_gamma (0=no decay, e.g. 0.5=from 50%%)')
+    parser.add_argument(
+        '--lr_decay_gamma', type=float, default=0.5,
+        help='linear decay end: lr = lr_main*gamma at last episode (default: 0.5)')
+    parser.add_argument(
         '--minibatch_steps',
         type=int,
         default=32,
         help='minibatch_steps ppo (default: 32)')
+    # SAC 专用参数（main_SAC_AC.py）
+    parser.add_argument('--lr_sac_actor', type=float, default=3e-4, help='SAC actor lr (default: 3e-4)')
+    parser.add_argument('--lr_sac_critic', type=float, default=3e-4, help='SAC critic lr (default: 3e-4)')
+    parser.add_argument('--sac_alpha', type=float, default=0.2, help='SAC entropy coef (default: 0.2)')
+    parser.add_argument('--sac_tau', type=float, default=0.005, help='SAC target soft update (default: 0.005)')
+    parser.add_argument('--sac_buffer_size', type=int, default=100000, help='SAC replay buffer size (default: 100000)')
+    parser.add_argument('--sac_batch_size', type=int, default=256, help='SAC batch size (default: 256)')
+    parser.add_argument('--sac_warmup_steps', type=int, default=1000, help='SAC warmup steps before train (default: 1000)')
     parser.add_argument(
         '--save_path',
         default='meta_model_',
         help='directory to save models (default: meta_model_)')
     parser.add_argument(
+        '--meta_model_path',
+        type=str,
+        default='',
+        help='Override meta model path when loading. Empty=auto from save_path+AC_SEE+sigma_add+meta_episode+lr+area (default: )')
+    parser.add_argument(
         '--target_average_step',
         type=int,
         default=100,
         help='target_average_step (default: 100)')
+    parser.add_argument(
+        '--save_best',
+        action='store_true',
+        default=True,
+        help='save best model by rolling reward during training (default: True)')
+    parser.add_argument(
+        '--no_save_best',
+        action='store_true',
+        default=False,
+        help='disable save best model (default: False)')
+    parser.add_argument(
+        '--save_best_rolling',
+        type=int,
+        default=50,
+        help='rolling window episodes for best reward (default: 50)')
     parser.add_argument(
         '--Do_meta',
         action='store_true',
@@ -155,6 +194,26 @@ def get_args():
         type=float,
         default=0.5,
         help='temperature coefficient for semantic weighting softmax (smaller=more emphasis on good agents) (default: 0.5)')
+    parser.add_argument(
+        '--fl_noise_sigma',
+        type=float,
+        default=1e-8,
+        help='std of Gaussian noise used to initialize FL aggregation accumulators (backup-style noisy mean init, default: 1e-8)')
+    parser.add_argument(
+        '--fl_use_success_rate_weighting',
+        action='store_true',
+        default=False,
+        help='if use success rate as aggregation weights instead of uniform weights (default: False, use uniform weights - standard FedAvg)')
+    parser.add_argument(
+        '--state_use_episode_progress',
+        action='store_true',
+        default=True,
+        help='if include episode progress (ind_episode/n_episode) in state vector (default: True). Use --no-state_use_episode_progress to disable it for consistency across different n_episode values')
+    parser.add_argument(
+        '--no-state_use_episode_progress',
+        dest='state_use_episode_progress',
+        action='store_false',
+        help='disable episode progress in state vector to ensure consistency across different n_episode values (use this when comparing experiments with different n_episode)')
     parser.add_argument(
         '--fl_average_actor',
         action='store_true',
@@ -224,7 +283,12 @@ def get_args():
         '--sigma_add',
         type=float,
         default=0.3,
-        help='sigma add on (default: 0.3)')
+        help='sigma add on policy Normal scale for exploration (default: 0.1)')
+    parser.add_argument(
+        '--sigma_max',
+        type=float,
+        default=2.0,
+        help='SAC only: clip policy Normal scale to [sigma_add+1e-5, sigma_max] to avoid instability (default: 2.0)')
     parser.add_argument(
         '--env_choice',
         type=int,
@@ -247,6 +311,42 @@ def get_args():
         type=float,
         default=0.06,
         help='Circuit power in linear scale for EE calculation (default: 0.06)')
+    parser.add_argument(
+        '--sig2_dB',
+        type=float,
+        default=-160,
+        help='Noise power spectral density in dB (default: -160). Thermal -204; use -60~-65 for SINR -10~20 dB')
+    parser.add_argument(
+        '--area_size',
+        type=float,
+        default=25.0,
+        help='Scenario area side length in m (default: 25). GBS at center.')
+    parser.add_argument(
+        '--model_save_dir',
+        type=str,
+        default='',
+        help='Subdir under model/ for saving (e.g. exp1_area25). Empty=default model/')
+    parser.add_argument(
+        '--experiment_tag',
+        type=str,
+        default='',
+        help='Tag for tensorboard run name (e.g. exp1_area25). Empty=no tag')
+    parser.add_argument(
+        '--log_dir',
+        type=str,
+        default='logs/tensorboard',
+        help='Base directory for tensorboard logs (e.g. logs/exp4). Default: logs/tensorboard')
+    parser.add_argument(
+        '--path_loss_offset_dB',
+        type=float,
+        default=0,
+        help='Offset subtracted from path loss (dB). Use 55 to raise min SNR to >= -20 dB for area=500 (default: 0)')
+    parser.add_argument(
+        '--path_loss_model',
+        type=str,
+        default='A2G',
+        choices=['A2G', '3GPP_UMa'],
+        help='Path loss model: A2G (ITU) or 3GPP_UMa (PL=128.1+37.6*log10(d_3d/1000)) (default: A2G)')
     parser.add_argument(
         '--semantic_A_max',
         type=float,
@@ -277,6 +377,12 @@ def get_args():
         type=float,
         default=2.0,
         help='Offset parameter in Sigmoid model (default: 2.0)')
+    # Task similarity model: Q = A_peak*(1-e^{-xi*rho})/(1+e^{-zeta*(gamma-gamma0)}) + b (SNR -20~60 dB)
+    parser.add_argument('--task_sim_A_peak', type=float, default=0.7128, help='Task sim model A_peak (default: 0.7128)')
+    parser.add_argument('--task_sim_xi', type=float, default=10.0, help='Task sim model xi (default: 10.0)')
+    parser.add_argument('--task_sim_zeta', type=float, default=0.2313, help='Task sim model zeta (default: 0.2313)')
+    parser.add_argument('--task_sim_gamma0', type=float, default=0.0, help='Task sim model gamma0 (default: 0.0)')
+    parser.add_argument('--task_sim_b', type=float, default=0.3249, help='Task sim model b (default: 0.3249)')
     parser.add_argument(
         '--collision_penalty',
         type=float,
@@ -292,16 +398,6 @@ def get_args():
         type=float,
         default=0.5,
         help='Minimum acceptable semantic accuracy threshold (default: 0.5)')
-    parser.add_argument(
-        '--use_gat',
-        action='store_true',
-        default=False,
-        help='Use Graph Attention Network instead of MLP (default: False, set --use_gat to enable)')
-    parser.add_argument(
-        '--num_gat_heads',
-        type=int,
-        default=4,
-        help='Number of attention heads in GAT (default: 4)')
     args = parser.parse_args()
 
     # args.cuda = not args.no_cuda and tf.test.is_gpu_available()

@@ -38,53 +38,48 @@ i_episode = 0
 ACTOR_NUM = 1
 current_fed_times = 0
 
-def get_state(env, idx=(0, 0), n_veh = 1, ind_episode=0.):
-    """ Get state from the environment (updated to include semantic communication metrics) """
+# 与 main_PPO_AC 一致：episode 进度开关、SINR 归一化范围
+USE_EPISODE_PROGRESS = getattr(args, 'state_use_episode_progress', True)
+SINR_DB_LOW = -30
+SINR_DB_HIGH = 70
+
+
+def get_state(env, idx=(0, 0), n_veh=1, ind_episode=0.):
+    """与 main_PPO_AC.get_state 完全一致，保证 meta 模型加载后状态维度与语义一致"""
     cellular_fast = (env.cellular_channels_with_fastfading[idx[0], :] - env.cellular_channels_abs[idx[0]] + 10) / 35
     cellular_abs = (env.cellular_channels_abs[idx[0]] - 80) / 60.0
     success = env.success[idx[0]]
-    channel_choice = env.channel_choice / max(n_veh, 1)  # Avoid division by zero
+    channel_choice = env.channel_choice / max(n_veh, 1)
     vehicle_vector = np.zeros(n_RB)
-    for i in range (n_veh):
+    for i in range(n_veh):
         vehicle_vector[i] = 1 / n_veh
-    
-    # Semantic communication metrics (normalized)
+
     semantic_accuracy = getattr(env, 'semantic_accuracy', np.zeros(env.n_Veh))[idx[0]]
     semantic_EE = getattr(env, 'semantic_EE', np.zeros(env.n_Veh))[idx[0]]
-    semantic_similarity = getattr(env, 'semantic_similarity', np.zeros(env.n_Veh))[idx[0]]
     rho_current = getattr(env, 'rho_current', np.zeros(env.n_Veh))[idx[0]]
-    sinr_dB = 10 * np.log10(getattr(env, 'cellular_SINR', np.zeros(env.n_Veh))[idx[0]] + 1e-10)  # Convert to dB, avoid log(0)
-    sinr_normalized = (sinr_dB + 20) / 40.0  # Normalize: assume range [-20, 20] dB -> [0, 1]
+    sinr_dB = 10 * np.log10(getattr(env, 'cellular_SINR', np.zeros(env.n_Veh))[idx[0]] + 1e-10)
+    sinr_normalized = (sinr_dB - SINR_DB_LOW) / (SINR_DB_HIGH - SINR_DB_LOW)
     sinr_normalized = np.clip(sinr_normalized, 0.0, 1.0)
-    
-    # Normalize semantic metrics to [0, 1] range
-    # semantic_accuracy is already in [A2, A1] = [0.2, 1.0], normalize to [0, 1]
+
     semantic_accuracy_norm = (semantic_accuracy - 0.2) / 0.8 if 0.8 > 0 else semantic_accuracy
     semantic_accuracy_norm = np.clip(semantic_accuracy_norm, 0.0, 1.0)
-    
-    # semantic_EE can vary widely, use log normalization
-    semantic_EE_norm = np.log1p(semantic_EE) / np.log1p(10.0)  # Normalize assuming max ~10
+    semantic_EE_norm = np.log1p(semantic_EE) / np.log1p(10.0)
     semantic_EE_norm = np.clip(semantic_EE_norm, 0.0, 1.0)
-    
-    # semantic_similarity is already in [A2, A1] = [0.2, 1.0], normalize to [0, 1]
-    semantic_similarity_norm = (semantic_similarity - 0.2) / 0.8 if 0.8 > 0 else semantic_similarity
-    semantic_similarity_norm = np.clip(semantic_similarity_norm, 0.0, 1.0)
-    
-    # rho_current is already in [0, 1], no normalization needed
-    
+    semantic_meets_threshold = 1.0 if semantic_accuracy >= 0.5 else 0.0
+
     return np.concatenate((
-        np.reshape(cellular_fast, -1),      # n_RB维
-        np.reshape(cellular_abs, -1),       # n_RB维
-        np.reshape(channel_choice, -1),      # n_RB维
-        vehicle_vector,                      # n_RB维
+        np.reshape(cellular_fast, -1),
+        np.reshape(cellular_abs, -1),
+        np.reshape(channel_choice, -1),
+        vehicle_vector,
         np.asarray([
-            success,                         # 1维
-            ind_episode / (meta_episode),    # 1维
-            semantic_accuracy_norm,          # 1维 - 新增：语义准确度
-            semantic_EE_norm,                # 1维 - 新增：语义能量效率
-            semantic_similarity_norm,        # 1维 - 新增：语义相似度
-            rho_current,                     # 1维 - 新增：当前压缩比
-            sinr_normalized                  # 1维 - 新增：SINR (归一化)
+            success,
+            ind_episode / max(meta_episode, 1) if USE_EPISODE_PROGRESS else 0.0,
+            semantic_accuracy_norm,
+            semantic_EE_norm,
+            rho_current,
+            sinr_normalized,
+            semantic_meets_threshold
         ])
     ))
 
@@ -101,21 +96,35 @@ ppoes = []
 envs = []
 sess = tf.Session(config=my_config)
 
-# 固定使用SEE优化目标（只优化语义能量效率）
+# 固定使用SEE优化目标，环境参数与 main_PPO_AC 一致
 optimization_target = 'SEE'
 beta = args.beta if hasattr(args, 'beta') else 0.5
 circuit_power = args.circuit_power if hasattr(args, 'circuit_power') else 0.06
+area_size = getattr(args, 'area_size', 500.0)
+path_loss_offset_dB = getattr(args, 'path_loss_offset_dB', 0.0)
+path_loss_model = getattr(args, 'path_loss_model', 'A2G')
+task_sim_A_peak = getattr(args, 'task_sim_A_peak', 0.7128)
+task_sim_xi = getattr(args, 'task_sim_xi', 10.0)
+task_sim_zeta = getattr(args, 'task_sim_zeta', 0.2313)
+task_sim_gamma0 = getattr(args, 'task_sim_gamma0', 0.0)
+task_sim_b = getattr(args, 'task_sim_b', 0.3249)
+sig2_dB = getattr(args, 'sig2_dB', -160)
 
 for k in range(len(n_veh)):
     env = Environment_marl_general(
-        n_veh[k], n_RB, 
-        beta=beta, 
-        circuit_power=circuit_power, 
+        n_veh[k], n_RB,
+        beta=beta,
+        circuit_power=circuit_power,
         optimization_target=optimization_target,
-        semantic_A1=1.0,
-        semantic_A2=0.2,
-        semantic_C1=5.0,
-        semantic_C2=2.0
+        area_size=area_size,
+        task_sim_A_peak=task_sim_A_peak,
+        task_sim_xi=task_sim_xi,
+        task_sim_zeta=task_sim_zeta,
+        task_sim_gamma0=task_sim_gamma0,
+        task_sim_b=task_sim_b,
+        sig2_dB=sig2_dB,
+        path_loss_offset_dB=path_loss_offset_dB,
+        path_loss_model=path_loss_model
     )
     env.new_random_game()
     envs.append(env)
@@ -199,12 +208,7 @@ def simulate():
 
         gaes = ppo.get_gaes(rewards=rewards, v_preds=v_pred_alls, v_preds_next=v_preds_next)
         gaes = np.array(gaes).astype(dtype=np.float32)
-        # 归一化GAE，添加epsilon防止除以0（当所有GAE值相同时）
-        gaes_mean = gaes.mean()
-        gaes_std = gaes.std()
-        if gaes_std > 1e-8:
-            gaes = (gaes - gaes_mean) / gaes_std
-        # 如果所有GAE值相同（std=0），保持原值不变（不归一化）
+        gaes = (gaes - gaes.mean()) / (gaes.std() + 1e-8)
 
         state_alls = np.reshape(state_alls, newshape=(-1, n_veh[k], state_dim))
         action_alls = np.reshape(action_alls, newshape=(-1, n_veh[k], action_dim))
@@ -259,11 +263,11 @@ for i in range(meta_episode):
     loss_episode.append(sum(loss_batch) / BATCH_SIZE)
     print('Loss_episode: ', loss_episode[-1])
 
-# 构建模型路径，包含优化目标信息（固定为SEE）
+# 构建模型路径，包含优化目标信息（固定为SEE）、n_RB 及 area
 opt_target_str = optimization_target  # SEE
 opt_suffix = opt_target_str  # SEE（不再需要beta参数）
-
-model_path = args.save_path + 'AC_' + opt_suffix + '_' + '%s_' %sigma_add + '%d_' % meta_episode +'%s_' %args.lr_meta_a
+area_size = getattr(args, 'area_size', 500.0)
+model_path = args.save_path + 'AC_' + opt_suffix + '_' + '%s_' %sigma_add + '%d_' % meta_episode +'%s_' %args.lr_meta_a + 'nRB%d_' % n_RB + 'area%d_' % int(area_size)
 save_models(sess, model_path, ppo.saver)
 
 np.savetxt('./Train_data/Meta_Reward_'+ opt_suffix + '_' + '%s_' %sigma_add + '%d_' %meta_episode +'%s_' %args.lr_meta_a, record_reward)

@@ -28,8 +28,7 @@ fl_noise_sigma = getattr(args, 'fl_noise_sigma', 1e-8)
 # 如需恢复 GAT，请回退到包含 GAT 的版本或重新引入相关实现。
 
 class PPO(object):
-    def __init__(self, s_dim, a_bound, c1, c2, epsilon, lr, meta_lr, K, n_veh, n_RB, IS_meta, meta_episode,
-                 use_gat=False, num_gat_heads=4, node_feature_dim=None):
+    def __init__(self, s_dim, a_bound, c1, c2, epsilon, lr, meta_lr, K, n_veh, n_RB, IS_meta, meta_episode):
         self.a_bound = a_bound
         self.K = K
         self.s_dim = s_dim
@@ -40,8 +39,6 @@ class PPO(object):
         self.meta_episode = meta_episode
         self.gamma = args.gamma
         self.GAE_discount = args.lambda_advantage
-        if use_gat:
-            raise ValueError("当前版本已移除 GAT 编码器（use_gat=True 不再支持）。")
         self.s_input = tf.placeholder(tf.float32, shape=(None, self.s_dim), name='s_t')
 
         power_dist, RB_distribution, rho_distribution, self.v, params, self.saver = self._build_net('network', True)
@@ -100,18 +97,19 @@ class PPO(object):
             print("\nRestoring the model...")
             # 使用SEE优化目标（与meta_train_PPO_AC.py保持一致）
             optimization_target = 'SEE'
-            
-            # Meta训练保存格式: AC_SEE_{sigma_add}_{meta_episode}_{lr_meta_a}
-            # 与backup版本的区别：backup版本格式为 AC_{sigma_add}_{meta_episode}_{lr_meta_a}（无SEE）
-            # 当前版本格式为 AC_SEE_{sigma_add}_{meta_episode}_{lr_meta_a}（有SEE）
             opt_suffix = optimization_target  # 直接使用'SEE'
-            
-            # 使用实例变量self.meta_episode和args中的参数
+            area_size = getattr(args, 'area_size', 25.0)
+
+            # Meta路径：支持 --meta_model_path 覆盖，否则按 area 自动构建
+            # 格式: meta_model_AC_SEE_{sigma_add}_{meta_episode}_{lr_meta_a}_area{area}_
+            if getattr(args, 'meta_model_path', ''):
+                model_path = args.meta_model_path
+                print(f"Using override meta_model_path: {model_path}")
+            else:
+                model_path = args.save_path + 'AC_' + opt_suffix + '_' + '%s_' % sigma_add + '%d_' % self.meta_episode + '%s_' % args.lr_meta_a + 'area%d_' % int(area_size)
+
             for i in range(self.n_veh):
-                meta_save_path = args.save_path  # 使用args.save_path，默认是'meta_model_'
-                model_path = meta_save_path + 'AC_' + opt_suffix + '_' + '%s_' %sigma_add + '%d_' % self.meta_episode +'%s_' %args.lr_meta_a
                 print(f"Loading meta model for agent {i}: {model_path}")
-                print(f"  Expected path format: {model_path}")
                 self.load_models(self.sesses[i], model_path, self.saver)
 
     def load_models(self, sess, model_path, saver):
@@ -144,7 +142,19 @@ class PPO(object):
         else:
             print(f"⚠️  Warning: Model file does not exist: {full_model_path}")
             print(f"   Looking for: {full_model_path}.index")
-            
+
+            # 尝试无 area 后缀的路径（旧版 meta 模型）
+            if '_area' in model_path:
+                fallback_path = model_path.split('_area')[0] + '_'
+                fallback_full = os.path.join(dir_, "model/" + fallback_path)
+                if os.path.exists(fallback_full + '.index'):
+                    try:
+                        saver.restore(sess, fallback_full)
+                        print(f"✅ Loaded meta model (no area suffix): {fallback_full}")
+                        return
+                    except Exception as e:
+                        print(f"   Fallback (no area) also failed: {fallback_full}")
+
             # 尝试兼容backup版本的路径格式（无SEE后缀）
             if 'AC_SEE_' in model_path:
                 backup_model_path = model_path.replace('AC_SEE_', 'AC_')
@@ -234,58 +244,29 @@ class PPO(object):
         params = tf.global_variables(scope)
         return power_distribution, RB_distribution, rho_distribution, v, params, saver
 
-    def get_v(self, s, sess, node_features=None, adj_matrix=None, agent_idx=0):
-        """
-        Get value function estimate
-        Args:
-            s: state (for backward compatibility with MLP)
-            sess: TensorFlow session
-            node_features: [n_veh, node_feature_dim] node features (for GAT)
-            adj_matrix: [n_veh, n_veh] adjacency matrix (for GAT)
-            agent_idx: agent index (for GAT mode, to select which node's value)
-        """
-        if node_features is not None or adj_matrix is not None:
-            raise ValueError("当前版本已移除 GAT 编码器：get_v 不再支持 node_features/adj_matrix 输入。")
+    def get_v(self, s, sess):
         return sess.run(self.v, {self.s_input: np.array([s])}).squeeze()
 
-    def choose_action(self, s, sess, node_features=None, adj_matrix=None, agent_idx=0):
-        """
-        Choose action
-        Args:
-            s: state (for backward compatibility with MLP)
-            sess: TensorFlow session
-            node_features: [n_veh, node_feature_dim] node features (for GAT)
-            adj_matrix: [n_veh, n_veh] adjacency matrix (for GAT)
-            agent_idx: agent index (for GAT mode, to select which node's action)
-        """
-        if node_features is not None or adj_matrix is not None:
-            raise ValueError("当前版本已移除 GAT 编码器：choose_action 不再支持 node_features/adj_matrix 输入。")
+    def choose_action(self, s, sess):
         a = np.squeeze(sess.run(self.choose_action_op, {self.s_input: s[np.newaxis, :]}))
-        # 与 backup 完全一致：连续动作 clip 到 [-a_bound, a_bound]
         clipped_a = np.zeros(self.a_dim)
         clipped_a[0] = a[0]  # RB (Categorical)
         clipped_a[1] = np.clip(a[1], -self.a_bound[1], self.a_bound[1])
         clipped_a[2] = np.clip(a[2], -self.a_bound[2], self.a_bound[2])
         return clipped_a
 
-    def train(self, s, a, gae, reward, v_pred_next, sess, node_features=None, adj_matrix=None, agent_idx=0, lr=None):
+    def train(self, s, a, gae, reward, v_pred_next, sess, lr=None):
         """
-        Train the network
         Args:
-            s: state (for backward compatibility with MLP)
-            a: actions [batch_size, 3] (RB, Power, Compression Ratio)
-            gae: GAE advantages
-            reward: rewards
-            v_pred_next: next state values
+            s: state [batch, s_dim]
+            a: actions [batch, 3] (RB, Power, rho)
+            gae: GAE advantages [batch]
+            reward: rewards [batch]
+            v_pred_next: next state values [batch]
             sess: TensorFlow session
-            node_features: [batch_size, n_veh, node_feature_dim] (for GAT)
-            adj_matrix: [batch_size, n_veh, n_veh] (for GAT)
-            lr: 当前步学习率（可选，用于学习率衰减；None 则用构造时的 lr）
+            lr: learning rate (None = use default)
         """
         sess.run(self.update_params_op)
-        
-        if node_features is not None or adj_matrix is not None:
-            raise ValueError("当前版本已移除 GAT 编码器：train 不再支持 node_features/adj_matrix 输入。")
         lr_val = float(lr) if lr is not None else self.lr_default
         feed_dict = {
             self.s_input: s,
